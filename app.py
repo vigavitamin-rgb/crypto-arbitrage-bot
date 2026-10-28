@@ -117,9 +117,9 @@ def scan():
         return jsonify({'error': 'Unauthorized'}), 401
     with state_lock:
         if state['status'] == 'running':
-            return jsonify({'status': 'already_running'}), 409
+            return jsonify({'status': 'already_running'}), 200
         if time.monotonic() - last_started < MIN_GAP:
-            return jsonify({'status': 'rate_limited'}), 429
+            return jsonify({'status': 'rate_limited'}), 200
         last_started = time.monotonic()
         state['status'] = 'running'
     threading.Thread(target=worker, daemon=True).start()
