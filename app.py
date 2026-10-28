@@ -124,6 +124,18 @@ def scan():
         state['status'] = 'running'
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({'status': 'started'}), 202
+@app.post('/test-telegram')
+def test_telegram():
+    if not SCAN_TOKEN or request.headers.get('X-Scan-Token') != SCAN_TOKEN:
+        return jsonify({'error': 'Unauthorized'}), 401
+    try:
+        result = telegram_send('✅ Belisarius Arbitrage: тестовое сообщение. Связь с Telegram работает!')
+        if result == 'Telegram not configured':
+            return jsonify({'status': 'error', 'message': result}), 503
+        return jsonify({'status': 'sent', 'telegram_http_status': result}), 200
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': f'{type(exc).__name__}: {str(exc)[:150]}'}), 502
+
 
 
 if __name__ == '__main__':
