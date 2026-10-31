@@ -10,6 +10,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import websockets
+from market_overlap import build_report
 from flask import Flask, jsonify, request
 
 app = Flask(__name__)
@@ -44,6 +45,7 @@ started_at = datetime.now(timezone.utc).isoformat()
 quote_event = None
 latency_stats = {ex: {'messages': 0, 'last_receive': None, 'intervals_ms': [], 'processing_ms': []} for ex in EXCHANGES}
 scan_ms = []
+market_overlap_report = {'complete': False, 'status': 'pending'}
 source_age_ms = {ex: [] for ex in EXCHANGES}
 clock_by_exchange = {}
 clock_reference = {'offset_ms': None, 'rtt_ms': None, 'measured_at': None, 'source': 'OKX public server time'}
@@ -500,6 +502,19 @@ def coinbase_parser(data):
     return out
 
 
+async def market_overlap_loop():
+    global market_overlap_report
+    while True:
+        try:
+            report = await asyncio.to_thread(build_report)
+            with LOCK:
+                market_overlap_report = report
+            app.logger.info('Spot market overlap: %s', {k: report.get(k) for k in ('complete', 'rank_counts', 'usdt_rank_counts', 'exchange_counts', 'errors')})
+        except Exception as exc:
+            app.logger.warning('Spot market overlap refresh failed: %s', type(exc).__name__)
+        await asyncio.sleep(21600)
+
+
 async def diagnostics_loop():
     while True:
         await asyncio.sleep(30)
@@ -526,6 +541,7 @@ async def run():
         alert_loop(),
         diagnostics_loop(),
         exchange_clock_loop(),
+        market_overlap_loop(),
     ]
     await asyncio.gather(*jobs)
 
@@ -551,6 +567,14 @@ def latency():
     if not authorized():
         return jsonify({'error': 'Unauthorized'}), 401
     return jsonify(latency_snapshot())
+
+
+@app.get('/markets-overlap')
+def markets_overlap():
+    if not authorized():
+        return jsonify({'error': 'Unauthorized'}), 401
+    with LOCK:
+        return jsonify(market_overlap_report)
 
 
 @app.get('/results')
