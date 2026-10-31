@@ -17,6 +17,10 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 QUOTE_CURRENCIES = ('USDT', 'USD', 'USDC', 'EUR', 'BTC')
 BASE_ASSETS = ('BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'LINK', 'LTC')
+ALL_PAIRS_TEST = os.getenv('ALL_PAIRS_TEST', '1') == '1'
+MAX_WS_PAIRS_PER_EXCHANGE = max(1, int(os.getenv('MAX_WS_PAIRS_PER_EXCHANGE', '60')))
+PAIR_ROTATION_SECONDS = max(60, int(os.getenv('PAIR_ROTATION_SECONDS', '180')))
+PAIR_UNIVERSE = ()
 # Bounded active set; only pairs supported by >=2 exchanges enter calculations.
 SYMBOLS = tuple(f'{base}/{quote}' for quote in QUOTE_CURRENCIES for base in BASE_ASSETS if base != quote)
 ACTIVE_SYMBOLS = SYMBOLS
@@ -617,7 +621,7 @@ async def diagnostics_loop():
 
 
 async def run():
-    global quote_event, ACTIVE_SYMBOLS, SUPPORTED_BY_EXCHANGE, market_overlap_report
+    global quote_event, ACTIVE_SYMBOLS, SUPPORTED_BY_EXCHANGE, market_overlap_report, PAIR_UNIVERSE
     quote_event = asyncio.Event()
     # Catalog-first selection: no unsupported subscriptions and no full-market WS fanout.
     try:
@@ -629,7 +633,8 @@ async def run():
             for entries in report['ranked_pairs'].values():
                 for entry in entries:
                     matching[entry['pair']] = set(entry['exchanges'])
-            ACTIVE_SYMBOLS = tuple(s for s in SYMBOLS if len(matching.get(s, ())) >= 2)
+            PAIR_UNIVERSE = tuple(sorted(matching)) if ALL_PAIRS_TEST else SYMBOLS
+            ACTIVE_SYMBOLS = tuple(s for s in PAIR_UNIVERSE if len(matching.get(s, ())) >= 2)
             SUPPORTED_BY_EXCHANGE = {ex: tuple(s for s in ACTIVE_SYMBOLS if ex in matching[s])
                                      for ex in EXCHANGES}
         else:
@@ -646,25 +651,56 @@ async def run():
     for sym in ACTIVE_SYMBOLS:
         notification_pair_checks.setdefault(sym, 0)
         notification_pair_recovery_checks.setdefault(sym, 0)
-    jobs = []
-    def add(ex, url, subscription, parser):
-        if SUPPORTED_BY_EXCHANGE[ex]:
-            jobs.append(consume(ex, url, [subscription], parser))
-    add('okx', 'wss://ws.okx.com:8443/ws/v5/public',
-        {'op': 'subscribe', 'args': [{'channel': 'tickers', 'instId': s.replace('/', '-')} for s in SUPPORTED_BY_EXCHANGE['okx']]}, okx_parser)
-    add('mexc', 'wss://wbs-api.mexc.com/ws',
-        {'method': 'SUBSCRIPTION', 'params': [f"spot@public.aggre.bookTicker.v3.api.pb@10ms@{s.replace('/', '')}" for s in SUPPORTED_BY_EXCHANGE['mexc']]}, mexc_parser)
-    add('bitget', 'wss://ws.bitget.com/v2/ws/public',
-        {'op': 'subscribe', 'args': [{'instType': 'SPOT', 'channel': 'ticker', 'instId': s.replace('/', '')} for s in SUPPORTED_BY_EXCHANGE['bitget']]}, bitget_parser)
-    add('gate', 'wss://api.gateio.ws/ws/v4/',
-        {'time': int(time.time()), 'channel': 'spot.book_ticker', 'event': 'subscribe', 'payload': [s.replace('/', '_') for s in SUPPORTED_BY_EXCHANGE['gate']]}, gate_parser)
-    add('kraken', 'wss://ws.kraken.com/v2',
-        {'method': 'subscribe', 'params': {'channel': 'ticker', 'symbol': list(SUPPORTED_BY_EXCHANGE['kraken']), 'event_trigger': 'bbo'}}, kraken_parser)
-    add('coinbase', 'wss://advanced-trade-ws.coinbase.com',
-        {'type': 'subscribe', 'product_ids': [s.replace('/', '-') for s in SUPPORTED_BY_EXCHANGE['coinbase']], 'channel': 'ticker'}, coinbase_parser)
-    jobs += [alert_loop(), diagnostics_loop(), exchange_clock_loop(), market_overlap_loop()]
-    await asyncio.gather(*jobs)
+    # Cycle through the complete overlap universe in bounded WebSocket windows.
+    # Every pair supported on >=2 exchanges is visited; never subscribe to all at once.
+    async def window_jobs(current_pairs):
+        jobs = []
+        def add(ex, url, subscription, parser):
+            if current_pairs[ex]:
+                jobs.append(consume(ex, url, [subscription], parser))
+        add('okx', 'wss://ws.okx.com:8443/ws/v5/public',
+            {'op': 'subscribe', 'args': [{'channel': 'tickers', 'instId': s.replace('/', '-')} for s in current_pairs['okx']]}, okx_parser)
+        add('mexc', 'wss://wbs-api.mexc.com/ws',
+            {'method': 'SUBSCRIPTION', 'params': [f"spot@public.aggre.bookTicker.v3.api.pb@10ms@{s.replace('/', '')}" for s in current_pairs['mexc']]}, mexc_parser)
+        add('bitget', 'wss://ws.bitget.com/v2/ws/public',
+            {'op': 'subscribe', 'args': [{'instType': 'SPOT', 'channel': 'ticker', 'instId': s.replace('/', '')} for s in current_pairs['bitget']]}, bitget_parser)
+        add('gate', 'wss://api.gateio.ws/ws/v4/',
+            {'time': int(time.time()), 'channel': 'spot.book_ticker', 'event': 'subscribe', 'payload': [s.replace('/', '_') for s in current_pairs['gate']]}, gate_parser)
+        add('kraken', 'wss://ws.kraken.com/v2',
+            {'method': 'subscribe', 'params': {'channel': 'ticker', 'symbol': list(current_pairs['kraken']), 'event_trigger': 'bbo'}}, kraken_parser)
+        add('coinbase', 'wss://advanced-trade-ws.coinbase.com',
+            {'type': 'subscribe', 'product_ids': [s.replace('/', '-') for s in current_pairs['coinbase']], 'channel': 'ticker'}, coinbase_parser)
+        return jobs
+    
 
+    persistent = [asyncio.create_task(alert_loop()), asyncio.create_task(diagnostics_loop()),
+                  asyncio.create_task(exchange_clock_loop()), asyncio.create_task(market_overlap_loop())]
+    offset = 0
+    try:
+        while True:
+            current_pairs = {}
+            for ex in EXCHANGES:
+                supported = SUPPORTED_BY_EXCHANGE[ex]
+                n = len(supported)
+                current_pairs[ex] = tuple(supported[(offset + j) % n] for j in range(min(n, MAX_WS_PAIRS_PER_EXCHANGE))) if n else ()
+            with LOCK:
+                for key in list(quotes):
+                    if key[1] not in current_pairs.get(key[0], ()):
+                        del quotes[key]
+            jobs = [asyncio.create_task(job) for job in await window_jobs(current_pairs)]
+            app.logger.info('All-pairs test window offset=%s, subscriptions=%s, universe=%s',
+                            offset, {ex: len(v) for ex, v in current_pairs.items()}, len(ACTIVE_SYMBOLS))
+            try:
+                await asyncio.sleep(PAIR_ROTATION_SECONDS)
+            finally:
+                for job in jobs:
+                    job.cancel()
+                await asyncio.gather(*jobs, return_exceptions=True)
+            offset += MAX_WS_PAIRS_PER_EXCHANGE
+    finally:
+        for job in persistent:
+            job.cancel()
+        await asyncio.gather(*persistent, return_exceptions=True)
 
 def background():
     if os.getenv('TELEGRAM_STARTUP_TEST') == '1':
