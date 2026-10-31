@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -45,7 +46,7 @@ def telegram_send(message):
 def update_quote(exchange, symbol, bid, ask, bid_qty=None, ask_qty=None):
     try:
         bid, ask = float(bid), float(ask)
-        if not (0 < bid <= ask):
+        if not (math.isfinite(bid) and math.isfinite(ask) and 0 < bid <= ask):
             return
         with LOCK:
             quotes[(exchange, symbol)] = {'bid': bid, 'ask': ask, 'bid_qty': bid_qty, 'ask_qty': ask_qty, 'updated': time.monotonic()}
@@ -103,15 +104,19 @@ async def consume(exchange, url, subscribe, parser, ping_interval=20):
                 delay = 1
                 for message in subscribe:
                     await ws.send(json.dumps(message) if isinstance(message, (dict, list)) else message)
-                async for raw in ws:
-                    if isinstance(raw, bytes):
-                        continue
-                    try:
-                        data = json.loads(raw)
-                        for symbol, bid, ask, bq, aq in parser(data):
-                            update_quote(exchange, symbol, bid, ask, bq, aq)
-                    except (ValueError, TypeError, KeyError, IndexError):
-                        continue
+                async def keepalive():
+                    if exchange not in ('bitget', 'mexc'):
+                        return
+                    while True:
+                        await asyncio.sleep(20)
+                        await ws.send('ping' if exchange == 'bitget' else json.dumps({'method': 'PING'}))
+
+                heartbeat = asyncio.create_task(keepalive())
+                try:
+                    await read_feed(ws, exchange, parser)
+                finally:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -127,6 +132,18 @@ async def consume(exchange, url, subscribe, parser, ping_interval=20):
         await asyncio.sleep(delay)
         delay = min(delay * 2, 60)
 
+
+
+async def read_feed(ws, exchange, parser):
+    async for raw in ws:
+        if isinstance(raw, bytes) or raw == 'pong':
+            continue
+        try:
+            data = json.loads(raw)
+            for symbol, bid, ask, bq, aq in parser(data):
+                update_quote(exchange, symbol, bid, ask, bq, aq)
+        except (ValueError, TypeError, KeyError, IndexError):
+            continue
 
 def okx_parser(data):
     arg = data.get('arg') or {}
@@ -198,6 +215,7 @@ def coinbase_parser(data):
 
 async def run():
     pairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+    app.logger.info('WS V2 starting; Telegram configured: %s', bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID))
     jobs = [
         consume('okx', 'wss://ws.okx.com:8443/ws/v5/public', [{'op': 'subscribe', 'args': [{'channel': 'tickers', 'instId': s.replace('USDT', '-USDT')} for s in pairs]}], okx_parser),
         consume('mexc', 'wss://wbs-api.mexc.com/ws', [{'method': 'SUBSCRIPTION', 'params': [f'spot@public.bookTicker.v3.api@{s}' for s in pairs]}], mexc_parser),
@@ -217,7 +235,7 @@ def background():
 @app.get('/')
 def home():
     with LOCK:
-        return jsonify({'service': 'Crypto Arbitrage WS Prototype', 'status': 'online', 'connections': dict(connections)})
+        return jsonify({'service': 'Crypto Arbitrage WS Prototype', 'status': 'online', 'connections': dict(connections), 'telegram_configured': bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID), 'active_quote_count': sum(time.monotonic()-v['updated'] <= MAX_QUOTE_AGE for v in quotes.values())})
 
 
 @app.get('/results')
