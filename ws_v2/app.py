@@ -259,7 +259,7 @@ def opportunities():
                     unit_revenue = sell_price * (1 - TAKER_FEES_PCT[sell_ex] / 100)
                     # Budget is denominated in the pair's quote currency; no invented FX conversion.
                     quote_currency = symbol.split('/')[1]
-                    quantity = max(0.0, TRADE_BUDGET_USDT) / unit_cost
+                    sim_budget = (float(os.getenv('SIM_TRADE_BUDGET_BTC', '0.001')) if quote_currency == 'BTC'\n                                  else float(os.getenv('SIM_TRADE_BUDGET_' + quote_currency, '50')) if quote_currency != 'USDT'\n                                  else TRADE_BUDGET_USDT)\n                    quantity = max(0.0, sim_budget) / unit_cost
                     liquidity_verified = False
                     try:
                         buy_qty = float(buy['ask_qty'])
@@ -288,7 +288,7 @@ def opportunities():
                                     'budget_rub_per_exchange': BUDGET_RUB_PER_EXCHANGE,
                                     'rub_per_usdt_configured': RUB_PER_USDT > 0,
                                     'assumed_slippage_pct_per_side': SLIPPAGE_PCT})
-    return sorted(results, key=lambda x: x['gross_spread_pct'], reverse=True)
+    return sorted(results, key=lambda x: x['estimated_net_spread_pct'], reverse=True)
 
 
 async def alert_loop():
