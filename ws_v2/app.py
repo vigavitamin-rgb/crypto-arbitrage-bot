@@ -44,6 +44,7 @@ started_at = datetime.now(timezone.utc).isoformat()
 quote_event = None
 latency_stats = {ex: {'messages': 0, 'last_receive': None, 'intervals_ms': [], 'processing_ms': []} for ex in EXCHANGES}
 scan_ms = []
+source_age_ms = {ex: [] for ex in EXCHANGES}
 
 
 def summarize_ms(values):
@@ -53,6 +54,23 @@ def summarize_ms(values):
     return {'count': len(values), 'p50': round(ordered[len(ordered)//2], 2),
             'p95': round(ordered[min(len(ordered)-1, math.ceil(len(ordered)*0.95)-1)], 2),
             'max': round(ordered[-1], 2)}
+
+
+def record_source_age(exchange, timestamp, received_ms):
+    try:
+        if isinstance(timestamp, str) and 'T' in timestamp:
+            timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).timestamp() * 1000
+        else:
+            timestamp = float(timestamp)
+            if timestamp < 1e11:
+                timestamp *= 1000
+        age = received_ms - timestamp
+        if -2000 <= age <= 60000:
+            with LOCK:
+                source_age_ms[exchange].append(age)
+                del source_age_ms[exchange][:-500]
+    except (ValueError, TypeError, OverflowError):
+        return
 
 
 def record_latency(exchange, received_at, processed_at):
@@ -90,6 +108,7 @@ def latency_snapshot():
                  'parse_and_update_ms': summarize_ms(v['processing_ms'])}
                  for ex, v in latency_stats.items()},
                  'arbitrage_scan_ms': summarize_ms(scan_ms),
+                 'source_age_ms': {ex: summarize_ms(source_age_ms[ex]) for ex in EXCHANGES},
                  'quote_freshness': freshness_snapshot(),
                  'note': 'Local arrival intervals and processing durations, NOT exchange-to-server network latency.'}
 
@@ -243,7 +262,9 @@ async def consume(exchange, url, subscribe, parser, ping_interval=20):
 async def read_feed(ws, exchange, parser):
     async for raw in ws:
         received_at = time.monotonic()
+        received_ms = time.time() * 1000
         parsed = []
+        source_ts = None
         if isinstance(raw, bytes):
             if exchange == 'mexc':
                 try:
@@ -252,13 +273,25 @@ async def read_feed(ws, exchange, parser):
                     pass
         elif raw != 'pong':
             try:
-                parsed = parser(json.loads(raw))
+                data = json.loads(raw)
+                parsed = parser(data)
+                if exchange == 'okx':
+                    source_ts = (data.get('data') or [{}])[0].get('ts')
+                elif exchange == 'bitget':
+                    source_ts = data.get('ts')
+                elif exchange == 'gate':
+                    source_ts = (data.get('result') or {}).get('t')
+                elif exchange == 'kraken':
+                    source_ts = (data.get('data') or [{}])[0].get('timestamp')
+                elif exchange == 'coinbase':
+                    source_ts = data.get('timestamp')
             except (ValueError, TypeError, KeyError, IndexError):
                 pass
         if parsed:
             for symbol, bid, ask, bq, aq in parsed:
                 update_quote(exchange, symbol, bid, ask, bq, aq)
             record_latency(exchange, received_at, time.monotonic())
+            record_source_age(exchange, source_ts, received_ms)
 
 
 def okx_parser(data):
