@@ -387,6 +387,57 @@ def test_telegram():
         }), 502
 
 
+@app.post('/telegram-chat-check')
+def telegram_chat_check():
+    if (
+        not SCAN_TOKEN
+        or request.headers.get('X-Scan-Token') != SCAN_TOKEN
+    ):
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    if not TELEGRAM_TOKEN:
+        return jsonify({
+            'error': 'Telegram token not configured'
+        }), 503
+
+    try:
+        req = Request(
+            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates',
+            method='GET',
+        )
+
+        with urlopen(req, timeout=15) as response:
+            data = json.load(response)
+
+        chats = {}
+
+        for update in data.get('result', []):
+            for field in (
+                'message',
+                'edited_message',
+                'channel_post',
+                'my_chat_member',
+            ):
+                entry = update.get(field) or {}
+                chat = entry.get('chat') or {}
+
+                if 'id' in chat:
+                    chats[str(chat['id'])] = {
+                        'chat_id': chat['id'],
+                        'type': chat.get('type'),
+                    }
+
+        return jsonify({
+            'configured_chat_id': TELEGRAM_CHAT_ID,
+            'chats': list(chats.values()),
+            'updates_count': len(data.get('result', [])),
+        })
+
+    except Exception as exc:
+        return jsonify({
+            'error': safe_telegram_error(exc)
+        }), 502
+
 if __name__ == '__main__':
     app.run(
         host='0.0.0.0',
