@@ -45,6 +45,7 @@ quote_event = None
 latency_stats = {ex: {'messages': 0, 'last_receive': None, 'intervals_ms': [], 'processing_ms': []} for ex in EXCHANGES}
 scan_ms = []
 source_age_ms = {ex: [] for ex in EXCHANGES}
+clock_reference = {'offset_ms': None, 'rtt_ms': None, 'measured_at': None, 'source': 'OKX public server time'}
 
 
 def summarize_ms(values):
@@ -54,6 +55,42 @@ def summarize_ms(values):
     return {'count': len(values), 'p50': round(ordered[len(ordered)//2], 2),
             'p95': round(ordered[min(len(ordered)-1, math.ceil(len(ordered)*0.95)-1)], 2),
             'max': round(ordered[-1], 2)}
+
+
+def calibrate_clock():
+    """Estimate local wall-clock offset using midpoint and bound uncertainty by RTT/2."""
+    url = 'https://www.okx.com/api/v5/public/time'
+    try:
+        t0 = time.time() * 1000
+        with urlopen(Request(url, headers={'User-Agent': 'WS-latency-monitor'}), timeout=4) as response:
+            data = json.load(response)
+        t1 = time.time() * 1000
+        server_ms = float(data['data'][0]['ts'])
+        rtt = t1 - t0
+        if 0 <= rtt <= 1000:
+            with LOCK:
+                clock_reference.update({'offset_ms': server_ms - (t0 + t1) / 2,
+                                        'rtt_ms': rtt, 'measured_at': time.monotonic()})
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        app.logger.warning('Clock reference calibration unavailable')
+
+
+async def clock_calibration_loop():
+    while True:
+        await asyncio.to_thread(calibrate_clock)
+        await asyncio.sleep(60)
+
+
+def clock_snapshot():
+    with LOCK:
+        age = time.monotonic() - clock_reference['measured_at'] if clock_reference['measured_at'] is not None else None
+        valid = age is not None and age <= 180
+        return {'reference': clock_reference['source'], 'valid': valid,
+                'server_minus_local_ms': round(clock_reference['offset_ms'], 2) if valid else None,
+                'rtt_ms': round(clock_reference['rtt_ms'], 2) if valid else None,
+                'uncertainty_at_least_ms': round(clock_reference['rtt_ms'] / 2, 2) if valid else None,
+                'calibration_age_s': round(age, 1) if age is not None else None,
+                'scope': 'OKX clock only; other exchanges are not assumed synchronized'}
 
 
 def record_source_age(exchange, timestamp, received_ms):
@@ -109,6 +146,7 @@ def latency_snapshot():
                  for ex, v in latency_stats.items()},
                  'arbitrage_scan_ms': summarize_ms(scan_ms),
                  'source_age_ms': {ex: summarize_ms(source_age_ms[ex]) for ex in EXCHANGES},
+                 'clock_calibration': clock_snapshot(),
                  'quote_freshness': freshness_snapshot(),
                  'note': 'Local arrival intervals and processing durations, NOT exchange-to-server network latency.'}
 
@@ -443,6 +481,7 @@ async def run():
         consume('coinbase', 'wss://advanced-trade-ws.coinbase.com', [{'type': 'subscribe', 'product_ids': [s.replace('/', '-') for s in SYMBOLS], 'channel': 'ticker'}], coinbase_parser),
         alert_loop(),
         diagnostics_loop(),
+        clock_calibration_loop(),
     ]
     await asyncio.gather(*jobs)
 
