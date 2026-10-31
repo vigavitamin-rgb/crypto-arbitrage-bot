@@ -49,6 +49,10 @@ market_overlap_report = {'complete': False, 'status': 'pending'}
 feed_quarantine = set()
 feed_bad_checks = {ex: 0 for ex in EXCHANGES}
 feed_good_checks = {ex: 0 for ex in EXCHANGES}
+notified_active_pairs = set()
+notified_active_exchanges = set()
+notification_baseline_ready = False
+notification_last_sent = 0.0
 source_age_ms = {ex: [] for ex in EXCHANGES}
 clock_by_exchange = {}
 clock_reference = {'offset_ms': None, 'rtt_ms': None, 'measured_at': None, 'source': 'OKX public server time'}
@@ -518,6 +522,52 @@ async def market_overlap_loop():
         await asyncio.sleep(21600)
 
 
+async def notify_market_changes():
+    """Notify only confirmed feed changes, not every restart or brief quote gap."""
+    global notification_baseline_ready, notification_last_sent
+    now = time.monotonic()
+    with LOCK:
+        active_pairs = {sym for (ex, sym), q in quotes.items()
+                        if ex not in feed_quarantine and now - q['updated'] <= MAX_QUOTE_AGE}
+        active_exchanges = {ex for ex in EXCHANGES
+                            if connections.get(ex) == 'connected' and ex not in feed_quarantine}
+        if not notification_baseline_ready:
+            # Establish baseline after startup; no misleading "added" event on reboot.
+            notified_active_pairs.update(active_pairs)
+            notified_active_exchanges.update(active_exchanges)
+            notification_baseline_ready = True
+            return
+        added_pairs = sorted(active_pairs - notified_active_pairs)
+        removed_pairs = sorted(notified_active_pairs - active_pairs)
+        added_exchanges = sorted(active_exchanges - notified_active_exchanges)
+        removed_exchanges = sorted(notified_active_exchanges - active_exchanges)
+        if not any((added_pairs, removed_pairs, added_exchanges, removed_exchanges)):
+            return
+        if now - notification_last_sent < 180:
+            return
+    parts = ['📡 Изменение мониторинга арбитража']
+    if added_pairs:
+        parts.append('✅ Пары появились в мониторинге: ' + ', '.join(added_pairs))
+    if removed_pairs:
+        parts.append('⚠️ Пары временно недоступны: ' + ', '.join(removed_pairs))
+    if added_exchanges:
+        parts.append('✅ Биржи активны: ' + ', '.join(x.upper() for x in added_exchanges))
+    if removed_exchanges:
+        parts.append('⛔ Биржи исключены или недоступны: ' + ', '.join(x.upper() for x in removed_exchanges))
+    parts.append('Это изменение состояния потоков котировок, не подтверждение доступности торговли.')
+    try:
+        await asyncio.to_thread(telegram_send, '\\n'.join(parts))
+    except Exception as exc:
+        app.logger.warning('Market change Telegram notification failed: %s', type(exc).__name__)
+        return
+    with LOCK:
+        notified_active_pairs.clear()
+        notified_active_pairs.update(active_pairs)
+        notified_active_exchanges.clear()
+        notified_active_exchanges.update(active_exchanges)
+        notification_last_sent = now
+
+
 async def diagnostics_loop():
     while True:
         await asyncio.sleep(30)
@@ -536,6 +586,7 @@ async def diagnostics_loop():
                 if feed_good_checks[ex] >= 5 and ex in feed_quarantine:
                     feed_quarantine.remove(ex)
                     app.logger.info('Feed recovered: %s', ex)
+        await notify_market_changes()
         app.logger.info('Market feed status: %s %s excluded=%s', fresh, statuses, sorted(feed_quarantine))
         app.logger.info('Latency metrics (local only): %s', latency_snapshot())
 
