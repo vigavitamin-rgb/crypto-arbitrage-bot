@@ -229,6 +229,12 @@ async def run():
 
 
 def background():
+    if os.getenv('TELEGRAM_STARTUP_TEST') == '1':
+        try:
+            result = telegram_send('WebSocket V2: test notification; no trades executed.')
+            app.logger.info('Telegram test HTTP status: %s', result)
+        except Exception as exc:
+            app.logger.error('Telegram test failed: %s', type(exc).__name__)
     asyncio.run(run())
 
 
