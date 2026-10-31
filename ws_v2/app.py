@@ -15,7 +15,7 @@ from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-SYMBOLS = ('BTC/USDT', 'ETH/USDT', 'SOL/USDT')
+SYMBOLS = ('BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'LINK/USDT', 'LTC/USDT')
 EXCHANGES = ('okx', 'mexc', 'bitget', 'gate', 'kraken', 'coinbase')
 THRESHOLD = float(os.getenv('ALERT_THRESHOLD_PCT', '0.5'))
 SCAN_TOKEN = os.getenv('SCAN_TOKEN', '')
@@ -384,7 +384,7 @@ async def read_feed(ws, exchange, parser):
 def okx_parser(data):
     arg = data.get('arg') or {}
     inst = arg.get('instId', '')
-    if arg.get('channel') != 'tickers' or inst not in ('BTC-USDT', 'ETH-USDT', 'SOL-USDT'):
+    if arg.get('channel') != 'tickers' or inst.replace('-', '/') not in SYMBOLS:
         return []
     out = []
     for row in data.get('data', []):
@@ -448,7 +448,7 @@ def protobuf_fields(payload):
 def mexc_binary_parser(raw):
     wrapper = protobuf_fields(raw)
     symbol = wrapper.get(3, b'').decode('ascii')
-    if symbol not in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT') or 315 not in wrapper:
+    if symbol not in {s.replace('/', '') for s in SYMBOLS} or 315 not in wrapper:
         return []
     book = protobuf_fields(wrapper[315])
     bid, ask = book.get(1, b''), book.get(3, b'')
@@ -467,7 +467,7 @@ def bitget_parser(data):
     if arg.get('channel') != 'ticker':
         return []
     sym = arg.get('instId', '')
-    if sym not in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT'):
+    if sym not in {s.replace('/', '') for s in SYMBOLS}:
         return []
     return [(sym[:-4] + '/USDT', r.get('bidPr'), r.get('askPr'), r.get('bidSz'), r.get('askSz')) for r in data.get('data', [])]
 
@@ -477,7 +477,7 @@ def gate_parser(data):
         return []
     r = data.get('result') or {}
     sym = r.get('s', '')
-    if sym not in ('BTC_USDT', 'ETH_USDT', 'SOL_USDT'):
+    if sym.replace('_', '/') not in SYMBOLS:
         return []
     return [(sym.replace('_', '/'), r.get('b'), r.get('a'), r.get('B'), r.get('A'))]
 
@@ -500,7 +500,7 @@ def coinbase_parser(data):
     for event in data.get('events', []):
         for r in event.get('tickers', []):
             sym = r.get('product_id', '')
-            if sym in ('BTC-USDT', 'ETH-USDT', 'SOL-USDT'):
+            if sym.replace('-', '/') in SYMBOLS:
                 out.append((sym.replace('-', '/'), r.get('best_bid'), r.get('best_ask'), r.get('best_bid_quantity'), r.get('best_ask_quantity')))
     return out
 
@@ -543,7 +543,7 @@ async def diagnostics_loop():
 async def run():
     global quote_event
     quote_event = asyncio.Event()
-    pairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
+    pairs = [s.replace('/', '') for s in SYMBOLS]
     app.logger.info('WS V2 starting; Telegram configured: %s', bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID))
     jobs = [
         consume('okx', 'wss://ws.okx.com:8443/ws/v5/public', [{'op': 'subscribe', 'args': [{'channel': 'tickers', 'instId': s.replace('USDT', '-USDT')} for s in pairs]}], okx_parser),
@@ -605,7 +605,7 @@ def results():
         fresh = {f'{ex}:{sym}': {'bid': v['bid'], 'ask': v['ask'], 'age_seconds': round(now - v['updated'], 2)} for (ex, sym), v in quotes.items() if now - v['updated'] <= MAX_QUOTE_AGE}
         status = dict(connections)
         errs = dict(errors)
-    return jsonify({'started_at': started_at, 'connections': status, 'errors': errs, 'excluded_feeds': sorted(feed_quarantine), 'fresh_quotes': fresh, 'opportunities': opportunities()[:30]})
+    return jsonify({'started_at': started_at, 'monitored_symbols': list(SYMBOLS), 'connections': status, 'errors': errs, 'excluded_feeds': sorted(feed_quarantine), 'fresh_quotes': fresh, 'opportunities': opportunities()[:30]})
 
 
 @app.post('/scan')
