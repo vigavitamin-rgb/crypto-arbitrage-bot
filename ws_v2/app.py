@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 
 import websockets
 from market_overlap import build_report
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -574,6 +574,11 @@ def background():
 def home():
     with LOCK:
         return jsonify({'service': 'Crypto Arbitrage WS Prototype', 'status': 'online', 'connections': dict(connections), 'telegram_configured': bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID), 'active_quote_count': sum(time.monotonic()-v['updated'] <= MAX_QUOTE_AGE for v in quotes.values())})
+
+
+@app.get('/dashboard')
+def dashboard():
+    return send_file(os.path.join(os.path.dirname(__file__), 'dashboard.html'))
 
 
 @app.get('/latency')
