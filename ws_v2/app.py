@@ -69,6 +69,20 @@ def record_latency(exchange, received_at, processed_at):
         del stat['processing_ms'][:-500]
 
 
+def freshness_snapshot():
+    now = time.monotonic()
+    with LOCK:
+        result = {}
+        for ex in EXCHANGES:
+            pairs = {}
+            for sym in SYMBOLS:
+                quote = quotes.get((ex, sym))
+                age = round(max(0.0, now - quote['updated']) * 1000, 1) if quote else None
+                pairs[sym] = {'age_ms': age, 'fresh': age is not None and age <= MAX_QUOTE_AGE * 1000}
+            result[ex] = pairs
+        return result
+
+
 def latency_snapshot():
     with LOCK:
         return {'exchanges': {ex: {'messages_since_start': v['messages'],
@@ -76,6 +90,7 @@ def latency_snapshot():
                  'parse_and_update_ms': summarize_ms(v['processing_ms'])}
                  for ex, v in latency_stats.items()},
                  'arbitrage_scan_ms': summarize_ms(scan_ms),
+                 'quote_freshness': freshness_snapshot(),
                  'note': 'Local arrival intervals and processing durations, NOT exchange-to-server network latency.'}
 
 
