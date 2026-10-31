@@ -21,6 +21,7 @@ ALL_PAIRS_TEST = os.getenv('ALL_PAIRS_TEST', '1') == '1'
 MAX_WS_PAIRS_PER_EXCHANGE = max(1, int(os.getenv('MAX_WS_PAIRS_PER_EXCHANGE', '60')))
 PAIR_ROTATION_SECONDS = max(60, int(os.getenv('PAIR_ROTATION_SECONDS', '180')))
 PAIR_UNIVERSE = ()
+rotation_state = {'offset': 0, 'window_started': None, 'window_pairs': [], 'subscriptions': {}, 'completed_windows': 0}
 # Bounded active set; only pairs supported by >=2 exchanges enter calculations.
 SYMBOLS = tuple(f'{base}/{quote}' for quote in QUOTE_CURRENCIES for base in BASE_ASSETS if base != quote)
 ACTIVE_SYMBOLS = SYMBOLS
@@ -687,6 +688,10 @@ async def run():
                 for key in list(quotes):
                     if key[1] not in current_pairs.get(key[0], ()):
                         del quotes[key]
+            with LOCK:
+                rotation_state.update({'offset': offset, 'window_started': time.time(),
+                                       'window_pairs': sorted(window),
+                                       'subscriptions': {ex: len(v) for ex, v in current_pairs.items()}})
             jobs = [asyncio.create_task(job) for job in await window_jobs(current_pairs)]
             app.logger.info('All-pairs test window offset=%s, subscriptions=%s, universe=%s',
                             offset, {ex: len(v) for ex, v in current_pairs.items()}, len(ACTIVE_SYMBOLS))
@@ -696,6 +701,8 @@ async def run():
                 for job in jobs:
                     job.cancel()
                 await asyncio.gather(*jobs, return_exceptions=True)
+            with LOCK:
+                rotation_state['completed_windows'] += 1
             offset = (offset + MAX_WS_PAIRS_PER_EXCHANGE) % max(1, len(ACTIVE_SYMBOLS))
     finally:
         for job in persistent:
@@ -747,7 +754,11 @@ def results():
         fresh = {f'{ex}:{sym}': {'bid': v['bid'], 'ask': v['ask'], 'age_seconds': round(now - v['updated'], 2)} for (ex, sym), v in quotes.items() if now - v['updated'] <= MAX_QUOTE_AGE}
         status = dict(connections)
         errs = dict(errors)
-    return jsonify({'started_at': started_at, 'monitored_symbols': list(SYMBOLS), 'connections': status, 'errors': errs, 'excluded_feeds': sorted(feed_quarantine), 'fresh_quotes': fresh, 'opportunities': opportunities()[:30]})
+        rotation = dict(rotation_state)
+        rotation['window_pairs'] = list(rotation_state['window_pairs'])
+        rotation['subscriptions'] = dict(rotation_state['subscriptions'])
+        universe_count = len(ACTIVE_SYMBOLS)
+    return jsonify({'all_pairs_test': ALL_PAIRS_TEST, 'universe_count': universe_count, 'rotation': rotation, 'rotation_seconds': PAIR_ROTATION_SECONDS, 'started_at': started_at, 'monitored_symbols': rotation['window_pairs'], 'connections': status, 'errors': errs, 'excluded_feeds': sorted(feed_quarantine), 'fresh_quotes': fresh, 'opportunities': opportunities()[:30]})
 
 
 @app.post('/scan')
