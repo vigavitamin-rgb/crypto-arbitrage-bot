@@ -15,7 +15,12 @@ from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
-SYMBOLS = ('BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'LINK/USDT', 'LTC/USDT')
+QUOTE_CURRENCIES = ('USDT', 'USD', 'USDC', 'EUR', 'BTC')
+BASE_ASSETS = ('BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'ADA', 'LINK', 'LTC')
+# Bounded active set; only pairs supported by >=2 exchanges enter calculations.
+SYMBOLS = tuple(f'{base}/{quote}' for quote in QUOTE_CURRENCIES for base in BASE_ASSETS if base != quote)
+ACTIVE_SYMBOLS = SYMBOLS
+SUPPORTED_BY_EXCHANGE = {}
 EXCHANGES = ('okx', 'mexc', 'bitget', 'gate', 'kraken', 'coinbase')
 THRESHOLD = float(os.getenv('ALERT_THRESHOLD_PCT', '0.5'))
 SCAN_TOKEN = os.getenv('SCAN_TOKEN', '')
@@ -186,7 +191,7 @@ def freshness_snapshot():
         result = {}
         for ex in EXCHANGES:
             pairs = {}
-            for sym in SYMBOLS:
+            for sym in ACTIVE_SYMBOLS:
                 quote = quotes.get((ex, sym))
                 age = round(max(0.0, now - quote['updated']) * 1000, 1) if quote else None
                 pairs[sym] = {'age_ms': age, 'fresh': age is not None and age <= MAX_QUOTE_AGE * 1000}
@@ -240,7 +245,7 @@ def opportunities():
     with LOCK:
         snapshot = {k: v.copy() for k, v in quotes.items() if now - v['updated'] <= MAX_QUOTE_AGE and k[0] not in feed_quarantine}
     results = []
-    for symbol in SYMBOLS:
+    for symbol in ACTIVE_SYMBOLS:
         rows = [(ex, v) for (ex, sym), v in snapshot.items() if sym == symbol]
         for buy_ex, buy in rows:
             for sell_ex, sell in rows:
@@ -252,6 +257,8 @@ def opportunities():
                     sell_price = sell['bid'] * (1 - SLIPPAGE_PCT / 100)
                     unit_cost = buy_price * (1 + TAKER_FEES_PCT[buy_ex] / 100)
                     unit_revenue = sell_price * (1 - TAKER_FEES_PCT[sell_ex] / 100)
+                    # Budget is denominated in the pair's quote currency; no invented FX conversion.
+                    quote_currency = symbol.split('/')[1]
                     quantity = max(0.0, TRADE_BUDGET_USDT) / unit_cost
                     liquidity_verified = False
                     try:
@@ -269,9 +276,12 @@ def opportunities():
                                     'buy_ask': buy['ask'], 'sell_bid': sell['bid'],
                                     'gross_spread_pct': round(pct, 3),
                                     'estimated_net_spread_pct': round((unit_revenue / unit_cost - 1) * 100, 3),
-                                    'estimated_profit_usdt': round(net_profit, 4),
-                                    'estimated_profit_rub': round(net_profit * RUB_PER_USDT, 2) if RUB_PER_USDT > 0 else None,
-                                    'estimated_trade_cost_usdt': round(quantity * unit_cost, 2),
+                                    'estimated_profit_usdt': round(net_profit, 4) if quote_currency == 'USDT' else None,
+                                    'estimated_profit_quote': round(net_profit, 8),
+                                    'quote_currency': quote_currency,
+                                    'estimated_profit_rub': round(net_profit * RUB_PER_USDT, 2) if RUB_PER_USDT > 0 and quote_currency == 'USDT' else None,
+                                    'estimated_trade_cost_usdt': round(quantity * unit_cost, 2) if quote_currency == 'USDT' else None,
+                                    'estimated_trade_cost_quote': round(quantity * unit_cost, 8),
                                     'liquidity_verified': liquidity_verified,
                                     'buy_taker_fee_pct': TAKER_FEES_PCT[buy_ex],
                                     'sell_taker_fee_pct': TAKER_FEES_PCT[sell_ex],
@@ -302,8 +312,8 @@ async def alert_loop():
                        f"{item['symbol']}: {item['buy_exchange']} → {item['sell_exchange']}\n"
                        f"Покупка: {item['buy_ask']} / продажа: {item['sell_bid']}\n"
                        f"Спред: {item['gross_spread_pct']:.3f}%\n"
-                       f"Оценка чистой прибыли: {item['estimated_profit_usdt']:.4f} USDT "
-                       f"(оборот {item['estimated_trade_cost_usdt']:.2f} USDT)\n"
+                       f"Оценка чистой прибыли: {item['estimated_profit_quote']:.6f} {item['quote_currency']} "
+                       f"(оборот {item['estimated_trade_cost_quote']:.2f} {item['quote_currency']})\n"
                        f"Ликвидность подтверждена: {'да' if item['liquidity_verified'] else 'нет'}\n"
                        'Проверь комиссии, объём и доступность торгов.')
                 try:
@@ -392,7 +402,7 @@ async def read_feed(ws, exchange, parser):
 def okx_parser(data):
     arg = data.get('arg') or {}
     inst = arg.get('instId', '')
-    if arg.get('channel') != 'tickers' or inst.replace('-', '/') not in SYMBOLS:
+    if arg.get('channel') != 'tickers' or inst.replace('-', '/') not in ACTIVE_SYMBOLS:
         return []
     out = []
     for row in data.get('data', []):
@@ -456,13 +466,13 @@ def protobuf_fields(payload):
 def mexc_binary_parser(raw):
     wrapper = protobuf_fields(raw)
     symbol = wrapper.get(3, b'').decode('ascii')
-    if symbol not in {s.replace('/', '') for s in SYMBOLS} or 315 not in wrapper:
+    if symbol not in {s.replace('/', '') for s in ACTIVE_SYMBOLS} or 315 not in wrapper:
         return []
     book = protobuf_fields(wrapper[315])
     bid, ask = book.get(1, b''), book.get(3, b'')
     if not bid or not ask:
         return []
-    return [(symbol[:-4] + '/USDT', bid.decode('ascii'), ask.decode('ascii'),
+    return [(next(s for s in ACTIVE_SYMBOLS if s.replace('/', '') == symbol), bid.decode('ascii'), ask.decode('ascii'),
              book.get(2, b'').decode('ascii'), book.get(4, b'').decode('ascii'))]
 
 
@@ -475,9 +485,9 @@ def bitget_parser(data):
     if arg.get('channel') != 'ticker':
         return []
     sym = arg.get('instId', '')
-    if sym not in {s.replace('/', '') for s in SYMBOLS}:
+    if sym not in {s.replace('/', '') for s in ACTIVE_SYMBOLS}:
         return []
-    return [(sym[:-4] + '/USDT', r.get('bidPr'), r.get('askPr'), r.get('bidSz'), r.get('askSz')) for r in data.get('data', [])]
+    return [(next(s for s in ACTIVE_SYMBOLS if s.replace('/', '') == sym), r.get('bidPr'), r.get('askPr'), r.get('bidSz'), r.get('askSz')) for r in data.get('data', [])]
 
 
 def gate_parser(data):
@@ -485,7 +495,7 @@ def gate_parser(data):
         return []
     r = data.get('result') or {}
     sym = r.get('s', '')
-    if sym.replace('_', '/') not in SYMBOLS:
+    if sym.replace('_', '/') not in ACTIVE_SYMBOLS:
         return []
     return [(sym.replace('_', '/'), r.get('b'), r.get('a'), r.get('B'), r.get('A'))]
 
@@ -540,7 +550,7 @@ async def notify_market_changes():
             notified_active_exchanges.update(active_exchanges)
             notification_baseline_ready = True
             return
-        for sym in SYMBOLS:
+        for sym in ACTIVE_SYMBOLS:
             is_active = sym in active_pairs
             notification_pair_checks[sym] = notification_pair_checks[sym] + 1 if not is_active else 0
             notification_pair_recovery_checks[sym] = notification_pair_recovery_checks[sym] + 1 if is_active else 0
@@ -607,22 +617,52 @@ async def diagnostics_loop():
 
 
 async def run():
-    global quote_event
+    global quote_event, ACTIVE_SYMBOLS, SUPPORTED_BY_EXCHANGE, market_overlap_report
     quote_event = asyncio.Event()
-    pairs = [s.replace('/', '') for s in SYMBOLS]
-    app.logger.info('WS V2 starting; Telegram configured: %s', bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID))
-    jobs = [
-        consume('okx', 'wss://ws.okx.com:8443/ws/v5/public', [{'op': 'subscribe', 'args': [{'channel': 'tickers', 'instId': s.replace('USDT', '-USDT')} for s in pairs]}], okx_parser),
-        consume('mexc', 'wss://wbs-api.mexc.com/ws', [{'method': 'SUBSCRIPTION', 'params': [f'spot@public.aggre.bookTicker.v3.api.pb@10ms@{s}' for s in pairs]}], mexc_parser),
-        consume('bitget', 'wss://ws.bitget.com/v2/ws/public', [{'op': 'subscribe', 'args': [{'instType': 'SPOT', 'channel': 'ticker', 'instId': s} for s in pairs]}], bitget_parser),
-        consume('gate', 'wss://api.gateio.ws/ws/v4/', [{'time': int(time.time()), 'channel': 'spot.book_ticker', 'event': 'subscribe', 'payload': [s.replace('USDT', '_USDT') for s in pairs]}], gate_parser),
-        consume('kraken', 'wss://ws.kraken.com/v2', [{'method': 'subscribe', 'params': {'channel': 'ticker', 'symbol': list(SYMBOLS), 'event_trigger': 'bbo'}}], kraken_parser),
-        consume('coinbase', 'wss://advanced-trade-ws.coinbase.com', [{'type': 'subscribe', 'product_ids': [s.replace('/', '-') for s in SYMBOLS], 'channel': 'ticker'}], coinbase_parser),
-        alert_loop(),
-        diagnostics_loop(),
-        exchange_clock_loop(),
-        market_overlap_loop(),
-    ]
+    # Catalog-first selection: no unsupported subscriptions and no full-market WS fanout.
+    try:
+        report = await asyncio.to_thread(build_report)
+        with LOCK:
+            market_overlap_report = report
+        if report.get('complete'):
+            matching = {}
+            for entries in report['ranked_pairs'].values():
+                for entry in entries:
+                    matching[entry['pair']] = set(entry['exchanges'])
+            ACTIVE_SYMBOLS = tuple(s for s in SYMBOLS if len(matching.get(s, ())) >= 2)
+            SUPPORTED_BY_EXCHANGE = {ex: tuple(s for s in ACTIVE_SYMBOLS if ex in matching[s])
+                                     for ex in EXCHANGES}
+        else:
+            app.logger.warning('Catalog incomplete; falling back to original eight USDT pairs')
+            ACTIVE_SYMBOLS = tuple(s for s in SYMBOLS if s.endswith('/USDT'))
+            SUPPORTED_BY_EXCHANGE = {ex: ACTIVE_SYMBOLS for ex in EXCHANGES}
+    except Exception as exc:
+        app.logger.warning('Catalog selection failed: %s', type(exc).__name__)
+        ACTIVE_SYMBOLS = tuple(s for s in SYMBOLS if s.endswith('/USDT'))
+        SUPPORTED_BY_EXCHANGE = {ex: ACTIVE_SYMBOLS for ex in EXCHANGES}
+    app.logger.info('Active quote currencies: %s; selected pairs: %s; subscriptions: %s',
+                    QUOTE_CURRENCIES, len(ACTIVE_SYMBOLS),
+                    {ex: len(v) for ex, v in SUPPORTED_BY_EXCHANGE.items()})
+    for sym in ACTIVE_SYMBOLS:
+        notification_pair_checks.setdefault(sym, 0)
+        notification_pair_recovery_checks.setdefault(sym, 0)
+    jobs = []
+    def add(ex, url, subscription, parser):
+        if SUPPORTED_BY_EXCHANGE[ex]:
+            jobs.append(consume(ex, url, [subscription], parser))
+    add('okx', 'wss://ws.okx.com:8443/ws/v5/public',
+        {'op': 'subscribe', 'args': [{'channel': 'tickers', 'instId': s.replace('/', '-')} for s in SUPPORTED_BY_EXCHANGE['okx']]}, okx_parser)
+    add('mexc', 'wss://wbs-api.mexc.com/ws',
+        {'method': 'SUBSCRIPTION', 'params': [f"spot@public.aggre.bookTicker.v3.api.pb@10ms@{s.replace('/', '')}" for s in SUPPORTED_BY_EXCHANGE['mexc']]}, mexc_parser)
+    add('bitget', 'wss://ws.bitget.com/v2/ws/public',
+        {'op': 'subscribe', 'args': [{'instType': 'SPOT', 'channel': 'ticker', 'instId': s.replace('/', '')} for s in SUPPORTED_BY_EXCHANGE['bitget']]}, bitget_parser)
+    add('gate', 'wss://api.gateio.ws/ws/v4/',
+        {'time': int(time.time()), 'channel': 'spot.book_ticker', 'event': 'subscribe', 'payload': [s.replace('/', '_') for s in SUPPORTED_BY_EXCHANGE['gate']]}, gate_parser)
+    add('kraken', 'wss://ws.kraken.com/v2',
+        {'method': 'subscribe', 'params': {'channel': 'ticker', 'symbol': list(SUPPORTED_BY_EXCHANGE['kraken']), 'event_trigger': 'bbo'}}, kraken_parser)
+    add('coinbase', 'wss://advanced-trade-ws.coinbase.com',
+        {'type': 'subscribe', 'product_ids': [s.replace('/', '-') for s in SUPPORTED_BY_EXCHANGE['coinbase']], 'channel': 'ticker'}, coinbase_parser)
+    jobs += [alert_loop(), diagnostics_loop(), exchange_clock_loop(), market_overlap_loop()]
     await asyncio.gather(*jobs)
 
 
