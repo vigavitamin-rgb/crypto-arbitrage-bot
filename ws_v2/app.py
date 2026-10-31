@@ -42,6 +42,42 @@ connections = {}
 last_alert = {}
 started_at = datetime.now(timezone.utc).isoformat()
 quote_event = None
+latency_stats = {ex: {'messages': 0, 'last_receive': None, 'intervals_ms': [], 'processing_ms': []} for ex in EXCHANGES}
+scan_ms = []
+
+
+def summarize_ms(values):
+    if not values:
+        return {'count': 0, 'p50': None, 'p95': None, 'max': None}
+    ordered = sorted(values)
+    return {'count': len(values), 'p50': round(ordered[len(ordered)//2], 2),
+            'p95': round(ordered[min(len(ordered)-1, math.ceil(len(ordered)*0.95)-1)], 2),
+            'max': round(ordered[-1], 2)}
+
+
+def record_latency(exchange, received_at, processed_at):
+    with LOCK:
+        stat = latency_stats[exchange]
+        if stat['last_receive'] is not None:
+            delta = (received_at - stat['last_receive']) * 1000
+            if delta >= 0:
+                stat['intervals_ms'].append(delta)
+                del stat['intervals_ms'][:-500]
+        stat['last_receive'] = received_at
+        stat['messages'] += 1
+        stat['processing_ms'].append(max(0.0, (processed_at - received_at) * 1000))
+        del stat['processing_ms'][:-500]
+
+
+def latency_snapshot():
+    with LOCK:
+        return {'exchanges': {ex: {'messages_since_start': v['messages'],
+                 'message_interval_ms': summarize_ms(v['intervals_ms']),
+                 'parse_and_update_ms': summarize_ms(v['processing_ms'])}
+                 for ex, v in latency_stats.items()},
+                 'arbitrage_scan_ms': summarize_ms(scan_ms),
+                 'note': 'Local arrival intervals and processing durations, NOT exchange-to-server network latency.'}
+
 
 
 def authorized():
@@ -120,7 +156,12 @@ async def alert_loop():
     while True:
         await quote_event.wait()
         quote_event.clear()
-        for item in opportunities():
+        scan_started = time.monotonic()
+        found = opportunities()
+        with LOCK:
+            scan_ms.append((time.monotonic() - scan_started) * 1000)
+            del scan_ms[:-500]
+        for item in found:
             key = (item['symbol'], item['buy_exchange'], item['sell_exchange'])
             now = time.monotonic()
             with LOCK:
@@ -186,22 +227,24 @@ async def consume(exchange, url, subscribe, parser, ping_interval=20):
 
 async def read_feed(ws, exchange, parser):
     async for raw in ws:
+        received_at = time.monotonic()
+        parsed = []
         if isinstance(raw, bytes):
             if exchange == 'mexc':
                 try:
-                    for symbol, bid, ask, bq, aq in mexc_binary_parser(raw):
-                        update_quote(exchange, symbol, bid, ask, bq, aq)
+                    parsed = mexc_binary_parser(raw)
                 except (ValueError, UnicodeError):
                     pass
-            continue
-        if raw == 'pong':
-            continue
-        try:
-            data = json.loads(raw)
-            for symbol, bid, ask, bq, aq in parser(data):
+        elif raw != 'pong':
+            try:
+                parsed = parser(json.loads(raw))
+            except (ValueError, TypeError, KeyError, IndexError):
+                pass
+        if parsed:
+            for symbol, bid, ask, bq, aq in parsed:
                 update_quote(exchange, symbol, bid, ask, bq, aq)
-        except (ValueError, TypeError, KeyError, IndexError):
-            continue
+            record_latency(exchange, received_at, time.monotonic())
+
 
 def okx_parser(data):
     arg = data.get('arg') or {}
@@ -335,6 +378,7 @@ async def diagnostics_loop():
             fresh = {ex: sum(1 for (exchange, _), v in quotes.items() if exchange == ex and now - v['updated'] <= MAX_QUOTE_AGE) for ex in EXCHANGES}
             statuses = dict(connections)
         app.logger.info('Market feed status: %s %s', fresh, statuses)
+        app.logger.info('Latency metrics (local only): %s', latency_snapshot())
 
 
 async def run():
@@ -369,6 +413,13 @@ def background():
 def home():
     with LOCK:
         return jsonify({'service': 'Crypto Arbitrage WS Prototype', 'status': 'online', 'connections': dict(connections), 'telegram_configured': bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID), 'active_quote_count': sum(time.monotonic()-v['updated'] <= MAX_QUOTE_AGE for v in quotes.values())})
+
+
+@app.get('/latency')
+def latency():
+    if not authorized():
+        return jsonify({'error': 'Unauthorized'}), 401
+    return jsonify(latency_snapshot())
 
 
 @app.get('/results')
