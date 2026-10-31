@@ -46,6 +46,9 @@ quote_event = None
 latency_stats = {ex: {'messages': 0, 'last_receive': None, 'intervals_ms': [], 'processing_ms': []} for ex in EXCHANGES}
 scan_ms = []
 market_overlap_report = {'complete': False, 'status': 'pending'}
+feed_quarantine = set()
+feed_bad_checks = {ex: 0 for ex in EXCHANGES}
+feed_good_checks = {ex: 0 for ex in EXCHANGES}
 source_age_ms = {ex: [] for ex in EXCHANGES}
 clock_by_exchange = {}
 clock_reference = {'offset_ms': None, 'rtt_ms': None, 'measured_at': None, 'source': 'OKX public server time'}
@@ -227,7 +230,7 @@ def update_quote(exchange, symbol, bid, ask, bid_qty=None, ask_qty=None):
 def opportunities():
     now = time.monotonic()
     with LOCK:
-        snapshot = {k: v.copy() for k, v in quotes.items() if now - v['updated'] <= MAX_QUOTE_AGE}
+        snapshot = {k: v.copy() for k, v in quotes.items() if now - v['updated'] <= MAX_QUOTE_AGE and k[0] not in feed_quarantine}
     results = []
     for symbol in SYMBOLS:
         rows = [(ex, v) for (ex, sym), v in snapshot.items() if sym == symbol]
@@ -522,7 +525,18 @@ async def diagnostics_loop():
         with LOCK:
             fresh = {ex: sum(1 for (exchange, _), v in quotes.items() if exchange == ex and now - v['updated'] <= MAX_QUOTE_AGE) for ex in EXCHANGES}
             statuses = dict(connections)
-        app.logger.info('Market feed status: %s %s', fresh, statuses)
+        with LOCK:
+            for ex in EXCHANGES:
+                ok = statuses.get(ex) == 'connected' and fresh[ex] >= 2
+                feed_good_checks[ex] = feed_good_checks[ex] + 1 if ok else 0
+                feed_bad_checks[ex] = 0 if ok else feed_bad_checks[ex] + 1
+                if feed_bad_checks[ex] >= 5 and ex not in feed_quarantine:
+                    feed_quarantine.add(ex)
+                    app.logger.warning('Feed excluded: %s', ex)
+                if feed_good_checks[ex] >= 5 and ex in feed_quarantine:
+                    feed_quarantine.remove(ex)
+                    app.logger.info('Feed recovered: %s', ex)
+        app.logger.info('Market feed status: %s %s excluded=%s', fresh, statuses, sorted(feed_quarantine))
         app.logger.info('Latency metrics (local only): %s', latency_snapshot())
 
 
@@ -586,7 +600,7 @@ def results():
         fresh = {f'{ex}:{sym}': {'bid': v['bid'], 'ask': v['ask'], 'age_seconds': round(now - v['updated'], 2)} for (ex, sym), v in quotes.items() if now - v['updated'] <= MAX_QUOTE_AGE}
         status = dict(connections)
         errs = dict(errors)
-    return jsonify({'started_at': started_at, 'connections': status, 'errors': errs, 'fresh_quotes': fresh, 'opportunities': opportunities()[:30]})
+    return jsonify({'started_at': started_at, 'connections': status, 'errors': errs, 'excluded_feeds': sorted(feed_quarantine), 'fresh_quotes': fresh, 'opportunities': opportunities()[:30]})
 
 
 @app.post('/scan')
