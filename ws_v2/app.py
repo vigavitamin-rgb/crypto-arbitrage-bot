@@ -28,6 +28,8 @@ ACTIVE_SYMBOLS = SYMBOLS
 SUPPORTED_BY_EXCHANGE = {}
 EXCHANGES = ('okx', 'mexc', 'bitget', 'gate', 'kraken', 'coinbase')
 THRESHOLD = float(os.getenv('ALERT_THRESHOLD_PCT', '0.5'))
+# Telegram threshold applies to net spread after both taker fees and modeled slippage.
+MIN_NET_ALERT_PCT = max(0.0, float(os.getenv('MIN_NET_ALERT_PCT', '0')))
 SCAN_TOKEN = os.getenv('SCAN_TOKEN', '')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
@@ -309,6 +311,11 @@ async def alert_loop():
             scan_ms.append((time.monotonic() - scan_started) * 1000)
             del scan_ms[:-500]
         for item in found:
+            # Never notify on a gross spread alone: both exchange fees and slippage
+            # must be covered, and modeled profit must be strictly positive.
+            if (item['estimated_net_spread_pct'] <= MIN_NET_ALERT_PCT
+                    or item['estimated_profit_quote'] <= 0):
+                continue
             key = (item['symbol'], item['buy_exchange'], item['sell_exchange'])
             now = time.monotonic()
             with LOCK:
@@ -316,14 +323,16 @@ async def alert_loop():
                 if eligible:
                     last_alert[key] = now
             if eligible:
-                msg = ('⚡ Возможный спред (до комиссий)\n'
+                msg = ('✅ Потенциально прибыльный арбитраж (после комиссий)\n'
                        f"{item['symbol']}: {item['buy_exchange']} → {item['sell_exchange']}\n"
                        f"Покупка: {item['buy_ask']} / продажа: {item['sell_bid']}\n"
-                       f"Спред: {item['gross_spread_pct']:.3f}%\n"
+                       f"Спред до комиссий: {item['gross_spread_pct']:.3f}%\n"
+                       f"Чистый спред после комиссий и проскальзывания: {item['estimated_net_spread_pct']:.3f}%\n"
+                       f"Комиссии покупки/продажи: {item['buy_taker_fee_pct']:.3f}% / {item['sell_taker_fee_pct']:.3f}%\n"
                        f"Оценка чистой прибыли: {item['estimated_profit_quote']:.6f} {item['quote_currency']} "
                        f"(оборот {item['estimated_trade_cost_quote']:.2f} {item['quote_currency']})\n"
                        f"Ликвидность подтверждена: {'да' if item['liquidity_verified'] else 'нет'}\n"
-                       'Проверь комиссии, объём и доступность торгов.')
+                       'Оценка по заданным ставкам taker-комиссий, не гарантия исполнения. Проверь ликвидность и доступность торгов.')
                 try:
                     await asyncio.to_thread(telegram_send, msg)
                 except Exception as exc:
