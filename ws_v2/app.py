@@ -213,6 +213,16 @@ def coinbase_parser(data):
     return out
 
 
+async def diagnostics_loop():
+    while True:
+        await asyncio.sleep(30)
+        now = time.monotonic()
+        with LOCK:
+            fresh = {ex: sum(1 for (exchange, _), v in quotes.items() if exchange == ex and now - v['updated'] <= MAX_QUOTE_AGE) for ex in EXCHANGES}
+            statuses = dict(connections)
+        app.logger.info('Market feed status: %s %s', fresh, statuses)
+
+
 async def run():
     pairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
     app.logger.info('WS V2 starting; Telegram configured: %s', bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID))
@@ -224,6 +234,7 @@ async def run():
         consume('kraken', 'wss://ws.kraken.com/v2', [{'method': 'subscribe', 'params': {'channel': 'ticker', 'symbol': list(SYMBOLS), 'event_trigger': 'bbo'}}], kraken_parser),
         consume('coinbase', 'wss://advanced-trade-ws.coinbase.com', [{'type': 'subscribe', 'product_ids': [s.replace('/', '-') for s in SYMBOLS], 'channel': 'ticker'}], coinbase_parser),
         alert_loop(),
+        diagnostics_loop(),
     ]
     await asyncio.gather(*jobs)
 
