@@ -45,6 +45,7 @@ quote_event = None
 latency_stats = {ex: {'messages': 0, 'last_receive': None, 'intervals_ms': [], 'processing_ms': []} for ex in EXCHANGES}
 scan_ms = []
 source_age_ms = {ex: [] for ex in EXCHANGES}
+clock_by_exchange = {}
 clock_reference = {'offset_ms': None, 'rtt_ms': None, 'measured_at': None, 'source': 'OKX public server time'}
 
 
@@ -91,6 +92,48 @@ def clock_snapshot():
                 'uncertainty_at_least_ms': round(clock_reference['rtt_ms'] / 2, 2) if valid else None,
                 'calibration_age_s': round(age, 1) if age is not None else None,
                 'scope': 'OKX clock only; other exchanges are not assumed synchronized'}
+
+
+def exchange_clock_probe(exchange):
+    urls = {'okx': 'https://www.okx.com/api/v5/public/time',
+            'mexc': 'https://api.mexc.com/api/v3/time',
+            'kraken': 'https://api.kraken.com/0/public/Time'}
+    try:
+        t0 = time.time() * 1000
+        with urlopen(Request(urls[exchange], headers={'User-Agent': 'WS-latency-monitor'}), timeout=4) as response:
+            data = json.load(response)
+        t1 = time.time() * 1000
+        if exchange == 'okx':
+            server_ms = float(data['data'][0]['ts'])
+        elif exchange == 'mexc':
+            server_ms = float(data['serverTime'])
+        else:
+            server_ms = float(data['result']['unixtime']) * 1000
+        rtt = t1 - t0
+        if not (0 <= rtt <= 500):
+            return
+        with LOCK:
+            clock_by_exchange[exchange] = {'offset_ms': server_ms - (t0+t1)/2,
+                                           'rtt_ms': rtt, 'measured_at': time.monotonic()}
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        app.logger.warning('Clock calibration failed: %s', exchange)
+
+
+async def exchange_clock_loop():
+    while True:
+        for exchange in ('okx', 'mexc', 'kraken'):
+            await asyncio.to_thread(exchange_clock_probe, exchange)
+        await asyncio.sleep(60)
+
+
+def exchange_clock_snapshot():
+    now = time.monotonic()
+    with LOCK:
+        return {ex: {'valid': now-v['measured_at'] <= 180 and v['rtt_ms'] <= 200,
+                     'offset_ms': round(v['offset_ms'], 1),
+                     'rtt_ms': round(v['rtt_ms'], 1),
+                     'age_s': round(now-v['measured_at'], 1)}
+                for ex, v in clock_by_exchange.items()}
 
 
 def record_source_age(exchange, timestamp, received_ms):
@@ -146,6 +189,7 @@ def latency_snapshot():
                  for ex, v in latency_stats.items()},
                  'arbitrage_scan_ms': summarize_ms(scan_ms),
                  'source_age_ms': {ex: summarize_ms(source_age_ms[ex]) for ex in EXCHANGES},
+                 'exchange_clock_calibration': exchange_clock_snapshot(),
                  'clock_calibration': clock_snapshot(),
                  'quote_freshness': freshness_snapshot(),
                  'note': 'Local arrival intervals and processing durations, NOT exchange-to-server network latency.'}
@@ -481,7 +525,7 @@ async def run():
         consume('coinbase', 'wss://advanced-trade-ws.coinbase.com', [{'type': 'subscribe', 'product_ids': [s.replace('/', '-') for s in SYMBOLS], 'channel': 'ticker'}], coinbase_parser),
         alert_loop(),
         diagnostics_loop(),
-        clock_calibration_loop(),
+        exchange_clock_loop(),
     ]
     await asyncio.gather(*jobs)
 
