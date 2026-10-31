@@ -29,6 +29,7 @@ errors = {}
 connections = {}
 last_alert = {}
 started_at = datetime.now(timezone.utc).isoformat()
+quote_event = None
 
 
 def authorized():
@@ -51,6 +52,8 @@ def update_quote(exchange, symbol, bid, ask, bid_qty=None, ask_qty=None):
             return
         with LOCK:
             quotes[(exchange, symbol)] = {'bid': bid, 'ask': ask, 'bid_qty': bid_qty, 'ask_qty': ask_qty, 'updated': time.monotonic()}
+        if quote_event is not None:
+            quote_event.set()
     except (TypeError, ValueError):
         return
 
@@ -74,6 +77,8 @@ def opportunities():
 
 async def alert_loop():
     while True:
+        await quote_event.wait()
+        quote_event.clear()
         for item in opportunities():
             key = (item['symbol'], item['buy_exchange'], item['sell_exchange'])
             now = time.monotonic()
@@ -91,7 +96,7 @@ async def alert_loop():
                     await asyncio.to_thread(telegram_send, msg)
                 except Exception as exc:
                     app.logger.warning('Telegram send failed: %s', type(exc).__name__)
-        await asyncio.sleep(ALERT_CHECK_INTERVAL)
+
 
 
 async def consume(exchange, url, subscribe, parser, ping_interval=20):
@@ -225,6 +230,8 @@ async def diagnostics_loop():
 
 
 async def run():
+    global quote_event
+    quote_event = asyncio.Event()
     pairs = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT']
     app.logger.info('WS V2 starting; Telegram configured: %s', bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID))
     jobs = [
