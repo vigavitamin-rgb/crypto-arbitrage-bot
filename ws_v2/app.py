@@ -678,11 +678,8 @@ async def run():
     offset = 0
     try:
         while True:
-            current_pairs = {}
-            for ex in EXCHANGES:
-                supported = SUPPORTED_BY_EXCHANGE[ex]
-                n = len(supported)
-                current_pairs[ex] = tuple(supported[(offset + j) % n] for j in range(min(n, MAX_WS_PAIRS_PER_EXCHANGE))) if n else ()
+            window = set(ACTIVE_SYMBOLS[offset:offset + MAX_WS_PAIRS_PER_EXCHANGE])
+            current_pairs = {ex: tuple(s for s in SUPPORTED_BY_EXCHANGE[ex] if s in window) for ex in EXCHANGES}
             with LOCK:
                 for key in list(quotes):
                     if key[1] not in current_pairs.get(key[0], ()):
@@ -696,7 +693,7 @@ async def run():
                 for job in jobs:
                     job.cancel()
                 await asyncio.gather(*jobs, return_exceptions=True)
-            offset += MAX_WS_PAIRS_PER_EXCHANGE
+            offset = (offset + MAX_WS_PAIRS_PER_EXCHANGE) % max(1, len(ACTIVE_SYMBOLS))
     finally:
         for job in persistent:
             job.cancel()
