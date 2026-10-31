@@ -263,7 +263,10 @@ def opportunities():
                     unit_revenue = sell_price * (1 - TAKER_FEES_PCT[sell_ex] / 100)
                     # Budget is denominated in the pair's quote currency; no invented FX conversion.
                     quote_currency = symbol.split('/')[1]
-                    sim_budget = (float(os.getenv('SIM_TRADE_BUDGET_BTC', '0.001')) if quote_currency == 'BTC'\n                                  else float(os.getenv('SIM_TRADE_BUDGET_' + quote_currency, '50')) if quote_currency != 'USDT'\n                                  else TRADE_BUDGET_USDT)\n                    quantity = max(0.0, sim_budget) / unit_cost
+                    sim_budget = (float(os.getenv('SIM_TRADE_BUDGET_BTC', '0.001')) if quote_currency == 'BTC'
+                                  else float(os.getenv('SIM_TRADE_BUDGET_' + quote_currency, '50')) if quote_currency != 'USDT'
+                                  else TRADE_BUDGET_USDT)
+                    quantity = max(0.0, sim_budget) / unit_cost
                     liquidity_verified = False
                     try:
                         buy_qty = float(buy['ask_qty'])
@@ -312,13 +315,19 @@ async def alert_loop():
                 if eligible:
                     last_alert[key] = now
             if eligible:
-                msg = ('⚡ Возможный спред (до комиссий)\n'
-                       f"{item['symbol']}: {item['buy_exchange']} → {item['sell_exchange']}\n"
-                       f"Покупка: {item['buy_ask']} / продажа: {item['sell_bid']}\n"
-                       f"Спред: {item['gross_spread_pct']:.3f}%\n"
+                msg = ('⚡ Возможный спред (до комиссий)
+'
+                       f"{item['symbol']}: {item['buy_exchange']} → {item['sell_exchange']}
+"
+                       f"Покупка: {item['buy_ask']} / продажа: {item['sell_bid']}
+"
+                       f"Спред: {item['gross_spread_pct']:.3f}%
+"
                        f"Оценка чистой прибыли: {item['estimated_profit_quote']:.6f} {item['quote_currency']} "
-                       f"(оборот {item['estimated_trade_cost_quote']:.2f} {item['quote_currency']})\n"
-                       f"Ликвидность подтверждена: {'да' if item['liquidity_verified'] else 'нет'}\n"
+                       f"(оборот {item['estimated_trade_cost_quote']:.2f} {item['quote_currency']})
+"
+                       f"Ликвидность подтверждена: {'да' if item['liquidity_verified'] else 'нет'}
+"
                        'Проверь комиссии, объём и доступность торгов.')
                 try:
                     await asyncio.to_thread(telegram_send, msg)
@@ -585,7 +594,8 @@ async def notify_market_changes():
         parts.append('⛔ Соединения недоступны или исключены: ' + ', '.join(x.upper() for x in removed_exchanges))
     parts.append('Проверка: 5 последовательных циклов по 30 секунд. Это не изменение конфигурации торговых пар.')
     try:
-        await asyncio.to_thread(telegram_send, '\n'.join(parts))
+        await asyncio.to_thread(telegram_send, '
+'.join(parts))
     except Exception as exc:
         app.logger.warning('Market change Telegram notification failed: %s', type(exc).__name__)
         return
