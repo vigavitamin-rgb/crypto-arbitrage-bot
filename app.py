@@ -1,8 +1,9 @@
-
 import asyncio
+import json
 import os
 import threading
 import time
+
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -51,6 +52,35 @@ state = {
 last_started = 0.0
 
 
+def safe_telegram_error(exc):
+    if isinstance(exc, HTTPError):
+        try:
+            data = json.loads(
+                exc.read().decode('utf-8')
+            )
+
+            description = data.get(
+                'description',
+                'No description'
+            )
+
+            return (
+                f'Telegram HTTP {exc.code}: '
+                f'{description[:200]}'
+            )
+
+        except Exception:
+            return f'Telegram HTTP {exc.code}'
+
+    if isinstance(exc, URLError):
+        return (
+            'Telegram connection error: '
+            f'{type(exc.reason).__name__}'
+        )
+
+    return f'Telegram error: {type(exc).__name__}'
+
+
 def telegram_send(message):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         return 'Telegram not configured'
@@ -68,14 +98,6 @@ def telegram_send(message):
 
     with urlopen(req, timeout=15) as response:
         return str(response.status)
-
-
-def safe_telegram_error(exc):
-    if isinstance(exc, HTTPError):
-        return f'Telegram HTTP {exc.code}'
-    if isinstance(exc, URLError):
-        return f'Telegram connection error: {type(exc.reason).__name__}'
-    return f'Telegram error: {type(exc).__name__}'
 
 
 async def fetch_exchange(exchange_id):
@@ -96,7 +118,10 @@ async def fetch_exchange(exchange_id):
             if not exchange.markets[symbol].get('spot', False):
                 continue
 
-            book = await exchange.fetch_order_book(symbol, limit=5)
+            book = await exchange.fetch_order_book(
+                symbol,
+                limit=5
+            )
 
             if book.get('asks') and book.get('bids'):
                 ask, ask_qty = book['asks'][0][:2]
@@ -191,7 +216,8 @@ def worker():
 
         if opportunities:
             lines = [
-                'Возможные арбитражные спреды (до комиссий):'
+                'Возможные арбитражные спреды '
+                '(до комиссий):'
             ]
 
             for item in opportunities[:8]:
@@ -207,19 +233,26 @@ def worker():
         with state_lock:
             state.update(
                 status='ready',
-                last_run=datetime.now(timezone.utc).isoformat(),
+                last_run=datetime.now(
+                    timezone.utc
+                ).isoformat(),
                 results=opportunities,
                 errors=errors,
                 available_symbols=available,
                 last_error=None,
                 duration_seconds=round(
-                    time.monotonic() - started, 2
+                    time.monotonic() - started,
+                    2
                 ),
             )
 
         if message:
             try:
-                telegram_send(message)
+                result = telegram_send(message)
+
+                if result == 'Telegram not configured':
+                    with state_lock:
+                        state['last_error'] = result
 
             except Exception as exc:
                 error = safe_telegram_error(exc)
@@ -237,10 +270,12 @@ def worker():
             state.update(
                 status='failed',
                 last_error=(
-                    f'{type(exc).__name__}: {str(exc)[:250]}'
+                    f'{type(exc).__name__}: '
+                    f'{str(exc)[:250]}'
                 ),
                 duration_seconds=round(
-                    time.monotonic() - started, 2
+                    time.monotonic() - started,
+                    2
                 ),
             )
 
@@ -258,9 +293,13 @@ def home():
 def results():
     if (
         not SCAN_TOKEN
-        or request.headers.get('X-Scan-Token') != SCAN_TOKEN
+        or request.headers.get(
+            'X-Scan-Token'
+        ) != SCAN_TOKEN
     ):
-        return jsonify({'error': 'Unauthorized'}), 401
+        return jsonify({
+            'error': 'Unauthorized'
+        }), 401
 
     with state_lock:
         return jsonify(dict(state))
@@ -272,9 +311,13 @@ def scan():
 
     if (
         not SCAN_TOKEN
-        or request.headers.get('X-Scan-Token') != SCAN_TOKEN
+        or request.headers.get(
+            'X-Scan-Token'
+        ) != SCAN_TOKEN
     ):
-        return jsonify({'error': 'Unauthorized'}), 401
+        return jsonify({
+            'error': 'Unauthorized'
+        }), 401
 
     with state_lock:
         if state['status'] == 'running':
@@ -295,20 +338,27 @@ def scan():
         daemon=True,
     ).start()
 
-    return jsonify({'status': 'started'}), 202
+    return jsonify({
+        'status': 'started'
+    }), 202
 
 
 @app.post('/test-telegram')
 def test_telegram():
     if (
         not SCAN_TOKEN
-        or request.headers.get('X-Scan-Token') != SCAN_TOKEN
+        or request.headers.get(
+            'X-Scan-Token'
+        ) != SCAN_TOKEN
     ):
-        return jsonify({'error': 'Unauthorized'}), 401
+        return jsonify({
+            'error': 'Unauthorized'
+        }), 401
 
     try:
         result = telegram_send(
-            '✅ Belisarius Arbitrage: тестовое сообщение. '
+            '✅ Belisarius Arbitrage: '
+            'тестовое сообщение. '
             'Связь с Telegram работает!'
         )
 
