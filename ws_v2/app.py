@@ -53,6 +53,10 @@ notified_active_pairs = set()
 notified_active_exchanges = set()
 notification_baseline_ready = False
 notification_last_sent = 0.0
+notification_pair_checks = {sym: 0 for sym in SYMBOLS}
+notification_pair_recovery_checks = {sym: 0 for sym in SYMBOLS}
+notification_exchange_checks = {ex: 0 for ex in EXCHANGES}
+notification_exchange_recovery_checks = {ex: 0 for ex in EXCHANGES}
 source_age_ms = {ex: [] for ex in EXCHANGES}
 clock_by_exchange = {}
 clock_reference = {'offset_ms': None, 'rtt_ms': None, 'measured_at': None, 'source': 'OKX public server time'}
@@ -523,7 +527,7 @@ async def market_overlap_loop():
 
 
 async def notify_market_changes():
-    """Notify only confirmed feed changes, not every restart or brief quote gap."""
+    """Report sustained changes in feed availability; not configuration changes."""
     global notification_baseline_ready, notification_last_sent
     now = time.monotonic()
     with LOCK:
@@ -532,39 +536,50 @@ async def notify_market_changes():
         active_exchanges = {ex for ex in EXCHANGES
                             if connections.get(ex) == 'connected' and ex not in feed_quarantine}
         if not notification_baseline_ready:
-            # Establish baseline after startup; no misleading "added" event on reboot.
             notified_active_pairs.update(active_pairs)
             notified_active_exchanges.update(active_exchanges)
             notification_baseline_ready = True
             return
-        added_pairs = sorted(active_pairs - notified_active_pairs)
-        removed_pairs = sorted(notified_active_pairs - active_pairs)
-        added_exchanges = sorted(active_exchanges - notified_active_exchanges)
-        removed_exchanges = sorted(notified_active_exchanges - active_exchanges)
+        for sym in SYMBOLS:
+            is_active = sym in active_pairs
+            notification_pair_checks[sym] = notification_pair_checks[sym] + 1 if not is_active else 0
+            notification_pair_recovery_checks[sym] = notification_pair_recovery_checks[sym] + 1 if is_active else 0
+        for ex in EXCHANGES:
+            is_active = ex in active_exchanges
+            notification_exchange_checks[ex] = notification_exchange_checks[ex] + 1 if not is_active else 0
+            notification_exchange_recovery_checks[ex] = notification_exchange_recovery_checks[ex] + 1 if is_active else 0
+        added_pairs = sorted(s for s in SYMBOLS if s not in notified_active_pairs
+                             and notification_pair_recovery_checks[s] >= 5)
+        removed_pairs = sorted(s for s in notified_active_pairs
+                               if notification_pair_checks[s] >= 5)
+        added_exchanges = sorted(ex for ex in EXCHANGES if ex not in notified_active_exchanges
+                                 and notification_exchange_recovery_checks[ex] >= 5)
+        removed_exchanges = sorted(ex for ex in notified_active_exchanges
+                                   if notification_exchange_checks[ex] >= 5)
         if not any((added_pairs, removed_pairs, added_exchanges, removed_exchanges)):
             return
         if now - notification_last_sent < 180:
             return
-    parts = ['📡 Изменение мониторинга арбитража']
+    parts = ['📡 Изменение доступности потоков котировок']
     if added_pairs:
-        parts.append('✅ Пары появились в мониторинге: ' + ', '.join(added_pairs))
+        parts.append('✅ Котировки восстановлены: ' + ', '.join(added_pairs))
     if removed_pairs:
-        parts.append('⚠️ Пары временно недоступны: ' + ', '.join(removed_pairs))
+        parts.append('⚠️ Нет свежих котировок: ' + ', '.join(removed_pairs))
     if added_exchanges:
-        parts.append('✅ Биржи активны: ' + ', '.join(x.upper() for x in added_exchanges))
+        parts.append('✅ Соединения восстановлены: ' + ', '.join(x.upper() for x in added_exchanges))
     if removed_exchanges:
-        parts.append('⛔ Биржи исключены или недоступны: ' + ', '.join(x.upper() for x in removed_exchanges))
-    parts.append('Это изменение состояния потоков котировок, не подтверждение доступности торговли.')
+        parts.append('⛔ Соединения недоступны или исключены: ' + ', '.join(x.upper() for x in removed_exchanges))
+    parts.append('Проверка: 5 последовательных циклов по 30 секунд. Это не изменение конфигурации торговых пар.')
     try:
-        await asyncio.to_thread(telegram_send, '\\n'.join(parts))
+        await asyncio.to_thread(telegram_send, '\n'.join(parts))
     except Exception as exc:
         app.logger.warning('Market change Telegram notification failed: %s', type(exc).__name__)
         return
     with LOCK:
-        notified_active_pairs.clear()
-        notified_active_pairs.update(active_pairs)
-        notified_active_exchanges.clear()
-        notified_active_exchanges.update(active_exchanges)
+        notified_active_pairs.difference_update(removed_pairs)
+        notified_active_pairs.update(added_pairs)
+        notified_active_exchanges.difference_update(removed_exchanges)
+        notified_active_exchanges.update(added_exchanges)
         notification_last_sent = now
 
 
