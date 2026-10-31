@@ -23,7 +23,16 @@ TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 MAX_QUOTE_AGE = float(os.getenv('MAX_QUOTE_AGE_SECONDS', '3'))
 ALERT_COOLDOWN = float(os.getenv('ALERT_COOLDOWN_SECONDS', '120'))
 TRADE_BUDGET_USDT = float(os.getenv('SIM_TRADE_BUDGET_USDT', '50'))
-TAKER_FEE_PCT = float(os.getenv('SIM_TAKER_FEE_PCT', '0.1'))
+# Conservative entry-tier taker rates; account/region/pair discounts may differ.
+TAKER_FEES_PCT = {'okx': 0.35, 'mexc': 0.05, 'bitget': 0.10,
+                  'gate': 0.10, 'kraken': 0.80, 'coinbase': 0.90}
+TAKER_FEES_PCT = {ex: float(os.getenv('SIM_TAKER_FEE_' + ex.upper() + '_PCT', rate))
+                  for ex, rate in TAKER_FEES_PCT.items()}
+BUDGET_RUB_PER_EXCHANGE = float(os.getenv('SIM_BUDGET_RUB_PER_EXCHANGE', '5000'))
+RUB_PER_USDT = float(os.getenv('SIM_RUB_PER_USDT', '0'))
+# Until a verified conversion rate is configured, keep the previous 50 USDT test size.
+TRADE_BUDGET_USDT = (BUDGET_RUB_PER_EXCHANGE / RUB_PER_USDT if RUB_PER_USDT > 0
+                     else float(os.getenv('SIM_TRADE_BUDGET_USDT', '50')))
 SLIPPAGE_PCT = float(os.getenv('SIM_SLIPPAGE_PCT', '0.05'))
 ALERT_CHECK_INTERVAL = float(os.getenv('ALERT_CHECK_INTERVAL_SECONDS', '0.02'))
 LOCK = threading.RLock()
@@ -76,8 +85,8 @@ def opportunities():
                 if pct >= THRESHOLD:
                     buy_price = buy['ask'] * (1 + SLIPPAGE_PCT / 100)
                     sell_price = sell['bid'] * (1 - SLIPPAGE_PCT / 100)
-                    unit_cost = buy_price * (1 + TAKER_FEE_PCT / 100)
-                    unit_revenue = sell_price * (1 - TAKER_FEE_PCT / 100)
+                    unit_cost = buy_price * (1 + TAKER_FEES_PCT[buy_ex] / 100)
+                    unit_revenue = sell_price * (1 - TAKER_FEES_PCT[sell_ex] / 100)
                     quantity = max(0.0, TRADE_BUDGET_USDT) / unit_cost
                     liquidity_verified = False
                     try:
@@ -96,7 +105,10 @@ def opportunities():
                                     'estimated_profit_usdt': round(net_profit, 4),
                                     'estimated_trade_cost_usdt': round(quantity * unit_cost, 2),
                                     'liquidity_verified': liquidity_verified,
-                                    'assumed_fee_pct_per_side': TAKER_FEE_PCT,
+                                    'buy_taker_fee_pct': TAKER_FEES_PCT[buy_ex],
+                                    'sell_taker_fee_pct': TAKER_FEES_PCT[sell_ex],
+                                    'budget_rub_per_exchange': BUDGET_RUB_PER_EXCHANGE,
+                                    'rub_per_usdt_configured': RUB_PER_USDT > 0,
                                     'assumed_slippage_pct_per_side': SLIPPAGE_PCT})
     return sorted(results, key=lambda x: x['gross_spread_pct'], reverse=True)
 
