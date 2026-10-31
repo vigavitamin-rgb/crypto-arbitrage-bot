@@ -98,11 +98,14 @@ def opportunities():
                     except (TypeError, ValueError):
                         pass
                     net_profit = quantity * (unit_revenue - unit_cost)
+                    if net_profit <= 0:
+                        continue
                     results.append({'symbol': symbol, 'buy_exchange': buy_ex, 'sell_exchange': sell_ex,
                                     'buy_ask': buy['ask'], 'sell_bid': sell['bid'],
                                     'gross_spread_pct': round(pct, 3),
                                     'estimated_net_spread_pct': round((unit_revenue / unit_cost - 1) * 100, 3),
                                     'estimated_profit_usdt': round(net_profit, 4),
+                                    'estimated_profit_rub': round(net_profit * RUB_PER_USDT, 2) if RUB_PER_USDT > 0 else None,
                                     'estimated_trade_cost_usdt': round(quantity * unit_cost, 2),
                                     'liquidity_verified': liquidity_verified,
                                     'buy_taker_fee_pct': TAKER_FEES_PCT[buy_ex],
