@@ -15,6 +15,10 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
+# -----------------------------
+# Configuration
+# -----------------------------
+
 EXCHANGES = (
     'binance',
     'bybit',
@@ -32,11 +36,17 @@ SYMBOLS = (
     'SOL/USDT',
 )
 
-THRESHOLD = float(os.getenv('ALERT_THRESHOLD_PCT', '0.5'))
+THRESHOLD = float(
+    os.getenv('ALERT_THRESHOLD_PCT', '0.5')
+)
+
 SCAN_TOKEN = os.getenv('SCAN_TOKEN', '')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
-MIN_GAP = int(os.getenv('MIN_SCAN_GAP_SECONDS', '55'))
+
+MIN_GAP = int(
+    os.getenv('MIN_SCAN_GAP_SECONDS', '55')
+)
 
 state_lock = threading.Lock()
 
@@ -52,6 +62,22 @@ state = {
 last_started = 0.0
 
 
+# -----------------------------
+# Authorization
+# -----------------------------
+
+def authorized():
+    return (
+        bool(SCAN_TOKEN)
+        and request.headers.get('X-Scan-Token')
+        == SCAN_TOKEN
+    )
+
+
+# -----------------------------
+# Telegram
+# -----------------------------
+
 def safe_telegram_error(exc):
     if isinstance(exc, HTTPError):
         try:
@@ -59,9 +85,11 @@ def safe_telegram_error(exc):
                 exc.read().decode('utf-8')
             )
 
-            description = data.get(
-                'description',
-                'No description'
+            description = str(
+                data.get(
+                    'description',
+                    'No description'
+                )
             )
 
             return (
@@ -78,11 +106,33 @@ def safe_telegram_error(exc):
             f'{type(exc.reason).__name__}'
         )
 
-    return f'Telegram error: {type(exc).__name__}'
+    return (
+        f'Telegram error: '
+        f'{type(exc).__name__}'
+    )
+
+
+def telegram_api(method):
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError(
+            'Telegram token not configured'
+        )
+
+    req = Request(
+        f'https://api.telegram.org/'
+        f'bot{TELEGRAM_TOKEN}/{method}',
+        method='GET',
+    )
+
+    with urlopen(req, timeout=15) as response:
+        return json.load(response)
 
 
 def telegram_send(message):
-    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+    if not (
+        TELEGRAM_TOKEN
+        and TELEGRAM_CHAT_ID
+    ):
         return 'Telegram not configured'
 
     payload = urlencode({
@@ -91,7 +141,8 @@ def telegram_send(message):
     }).encode('utf-8')
 
     req = Request(
-        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+        f'https://api.telegram.org/'
+        f'bot{TELEGRAM_TOKEN}/sendMessage',
         data=payload,
         method='POST',
     )
@@ -99,6 +150,10 @@ def telegram_send(message):
     with urlopen(req, timeout=15) as response:
         return str(response.status)
 
+
+# -----------------------------
+# Exchange scanning
+# -----------------------------
 
 async def fetch_exchange(exchange_id):
     exchange = getattr(ccxt, exchange_id)({
@@ -115,12 +170,14 @@ async def fetch_exchange(exchange_id):
             if symbol not in exchange.markets:
                 continue
 
-            if not exchange.markets[symbol].get('spot', False):
+            market = exchange.markets[symbol]
+
+            if not market.get('spot', False):
                 continue
 
             book = await exchange.fetch_order_book(
                 symbol,
-                limit=5
+                limit=5,
             )
 
             if book.get('asks') and book.get('bids'):
@@ -141,7 +198,8 @@ async def fetch_exchange(exchange_id):
         return (
             exchange_id,
             {},
-            f'{type(exc).__name__}: {str(exc)[:180]}',
+            f'{type(exc).__name__}: '
+            f'{str(exc)[:180]}',
         )
 
     finally:
@@ -150,7 +208,10 @@ async def fetch_exchange(exchange_id):
 
 async def scan_all():
     data = await asyncio.gather(
-        *(fetch_exchange(e) for e in EXCHANGES)
+        *(
+            fetch_exchange(exchange)
+            for exchange in EXCHANGES
+        )
     )
 
     errors = {
@@ -162,14 +223,14 @@ async def scan_all():
     opportunities = []
 
     for symbol in SYMBOLS:
-        buyers = [
+        quotes_for_symbol = [
             (exchange, quotes[symbol])
             for exchange, quotes, _ in data
             if symbol in quotes
         ]
 
-        for buy_exchange, buy in buyers:
-            for sell_exchange, sell in buyers:
+        for buy_exchange, buy in quotes_for_symbol:
+            for sell_exchange, sell in quotes_for_symbol:
                 if buy_exchange == sell_exchange:
                     continue
 
@@ -184,7 +245,9 @@ async def scan_all():
                         'sell_exchange': sell_exchange,
                         'buy_ask': buy['ask'],
                         'sell_bid': sell['bid'],
-                        'gross_spread_pct': round(spread, 3),
+                        'gross_spread_pct': round(
+                            spread, 3
+                        ),
                         'max_top_book_base_qty': min(
                             buy['ask_qty'],
                             sell['bid_qty'],
@@ -192,7 +255,7 @@ async def scan_all():
                     })
 
     opportunities.sort(
-        key=lambda o: o['gross_spread_pct'],
+        key=lambda item: item['gross_spread_pct'],
         reverse=True,
     )
 
@@ -204,12 +267,16 @@ async def scan_all():
     return opportunities[:30], errors, available
 
 
+# -----------------------------
+# Background worker
+# -----------------------------
+
 def worker():
     started = time.monotonic()
 
     try:
-        opportunities, errors, available = asyncio.run(
-            scan_all()
+        opportunities, errors, available = (
+            asyncio.run(scan_all())
         )
 
         message = None
@@ -242,7 +309,7 @@ def worker():
                 last_error=None,
                 duration_seconds=round(
                     time.monotonic() - started,
-                    2
+                    2,
                 ),
             )
 
@@ -258,7 +325,7 @@ def worker():
                 error = safe_telegram_error(exc)
 
                 app.logger.error(
-                    "Telegram notification failed: %s",
+                    'Telegram notification failed: %s',
                     error,
                 )
 
@@ -275,10 +342,14 @@ def worker():
                 ),
                 duration_seconds=round(
                     time.monotonic() - started,
-                    2
+                    2,
                 ),
             )
 
+
+# -----------------------------
+# HTTP routes
+# -----------------------------
 
 @app.get('/')
 def home():
@@ -291,12 +362,7 @@ def home():
 
 @app.get('/results')
 def results():
-    if (
-        not SCAN_TOKEN
-        or request.headers.get(
-            'X-Scan-Token'
-        ) != SCAN_TOKEN
-    ):
+    if not authorized():
         return jsonify({
             'error': 'Unauthorized'
         }), 401
@@ -309,12 +375,7 @@ def results():
 def scan():
     global last_started
 
-    if (
-        not SCAN_TOKEN
-        or request.headers.get(
-            'X-Scan-Token'
-        ) != SCAN_TOKEN
-    ):
+    if not authorized():
         return jsonify({
             'error': 'Unauthorized'
         }), 401
@@ -325,7 +386,10 @@ def scan():
                 'status': 'already_running'
             }), 200
 
-        if time.monotonic() - last_started < MIN_GAP:
+        if (
+            time.monotonic() - last_started
+            < MIN_GAP
+        ):
             return jsonify({
                 'status': 'rate_limited'
             }), 200
@@ -345,12 +409,7 @@ def scan():
 
 @app.post('/test-telegram')
 def test_telegram():
-    if (
-        not SCAN_TOKEN
-        or request.headers.get(
-            'X-Scan-Token'
-        ) != SCAN_TOKEN
-    ):
+    if not authorized():
         return jsonify({
             'error': 'Unauthorized'
         }), 401
@@ -377,7 +436,7 @@ def test_telegram():
         error = safe_telegram_error(exc)
 
         app.logger.error(
-            "Telegram test failed: %s",
+            'Telegram test failed: %s',
             error,
         )
 
@@ -387,13 +446,16 @@ def test_telegram():
         }), 502
 
 
+# -----------------------------
+# Telegram diagnostics
+# -----------------------------
+
 @app.post('/telegram-chat-check')
 def telegram_chat_check():
-    if (
-        not SCAN_TOKEN
-        or request.headers.get('X-Scan-Token') != SCAN_TOKEN
-    ):
-        return jsonify({'error': 'Unauthorized'}), 401
+    if not authorized():
+        return jsonify({
+            'error': 'Unauthorized'
+        }), 401
 
     if not TELEGRAM_TOKEN:
         return jsonify({
@@ -401,42 +463,68 @@ def telegram_chat_check():
         }), 503
 
     try:
-        req = Request(
-            f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates',
-            method='GET',
+        bot_data = telegram_api('getMe')
+        webhook_data = telegram_api('getWebhookInfo')
+
+        bot = bot_data.get('result', {})
+        webhook = webhook_data.get('result', {})
+
+        webhook_active = bool(
+            webhook.get('url')
         )
 
-        with urlopen(req, timeout=15) as response:
-            data = json.load(response)
-
         chats = {}
+        updates_count = None
+        updates_error = None
 
-        for update in data.get('result', []):
-            for field in (
-                'message',
-                'edited_message',
-                'channel_post',
-                'my_chat_member',
-            ):
-                entry = update.get(field) or {}
-                chat = entry.get('chat') or {}
+        try:
+            updates_data = telegram_api('getUpdates')
 
-                if 'id' in chat:
-                    chats[str(chat['id'])] = {
-                        'chat_id': chat['id'],
-                        'type': chat.get('type'),
-                    }
+            updates = updates_data.get('result', [])
+            updates_count = len(updates)
+
+            for update in updates:
+                for field in (
+                    'message',
+                    'edited_message',
+                    'channel_post',
+                    'my_chat_member',
+                ):
+                    entry = update.get(field) or {}
+                    chat = entry.get('chat') or {}
+
+                    if 'id' in chat:
+                        chats[str(chat['id'])] = {
+                            'chat_id': chat['id'],
+                            'type': chat.get('type'),
+                        }
+
+        except Exception as exc:
+            updates_error = safe_telegram_error(exc)
 
         return jsonify({
             'configured_chat_id': TELEGRAM_CHAT_ID,
+            'bot_username': bot.get('username'),
+            'bot_id': bot.get('id'),
+            'webhook_active': webhook_active,
+            'pending_update_count': webhook.get(
+                'pending_update_count', 0
+            ),
             'chats': list(chats.values()),
-            'updates_count': len(data.get('result', [])),
+            'updates_count': updates_count,
+            'updates_error': updates_error,
         })
 
     except Exception as exc:
         return jsonify({
-            'error': safe_telegram_error(exc)
+            'status': 'error',
+            'message': safe_telegram_error(exc),
         }), 502
+
+
+# -----------------------------
+# Start server
+# -----------------------------
 
 if __name__ == '__main__':
     app.run(
