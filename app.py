@@ -15,13 +15,11 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# -----------------------------
-# Configuration
-# -----------------------------
+# =====================================
+# CONFIGURATION
+# =====================================
 
 EXCHANGES = (
-    'binance',
-    'bybit',
     'okx',
     'mexc',
     'bitget',
@@ -49,22 +47,22 @@ MIN_GAP = int(
 )
 
 state_lock = threading.Lock()
+last_started = 0.0
 
 state = {
     'status': 'ready',
     'last_run': None,
     'results': [],
     'errors': {},
+    'available_symbols': {},
     'last_error': None,
     'duration_seconds': None,
 }
 
-last_started = 0.0
 
-
-# -----------------------------
-# Authorization
-# -----------------------------
+# =====================================
+# AUTHORIZATION
+# =====================================
 
 def authorized():
     return (
@@ -74,9 +72,9 @@ def authorized():
     )
 
 
-# -----------------------------
-# Telegram
-# -----------------------------
+# =====================================
+# TELEGRAM
+# =====================================
 
 def safe_telegram_error(exc):
     if isinstance(exc, HTTPError):
@@ -86,10 +84,7 @@ def safe_telegram_error(exc):
             )
 
             description = str(
-                data.get(
-                    'description',
-                    'No description'
-                )
+                data.get('description', 'No description')
             )
 
             return (
@@ -107,7 +102,7 @@ def safe_telegram_error(exc):
         )
 
     return (
-        f'Telegram error: '
+        'Telegram error: '
         f'{type(exc).__name__}'
     )
 
@@ -129,10 +124,7 @@ def telegram_api(method):
 
 
 def telegram_send(message):
-    if not (
-        TELEGRAM_TOKEN
-        and TELEGRAM_CHAT_ID
-    ):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return 'Telegram not configured'
 
     payload = urlencode({
@@ -151,17 +143,19 @@ def telegram_send(message):
         return str(response.status)
 
 
-# -----------------------------
-# Exchange scanning
-# -----------------------------
+# =====================================
+# EXCHANGE SCANNING
+# =====================================
 
 async def fetch_exchange(exchange_id):
-    exchange = getattr(ccxt, exchange_id)({
-        'enableRateLimit': True,
-        'timeout': 12000,
-    })
+    exchange = None
 
     try:
+        exchange = getattr(ccxt, exchange_id)({
+            'enableRateLimit': True,
+            'timeout': 12000,
+        })
+
         await exchange.load_markets()
 
         quotes = {}
@@ -203,20 +197,21 @@ async def fetch_exchange(exchange_id):
         )
 
     finally:
-        await exchange.close()
+        if exchange is not None:
+            await exchange.close()
 
 
 async def scan_all():
     data = await asyncio.gather(
         *(
-            fetch_exchange(exchange)
-            for exchange in EXCHANGES
+            fetch_exchange(exchange_id)
+            for exchange_id in EXCHANGES
         )
     )
 
     errors = {
-        exchange: error
-        for exchange, _, error in data
+        exchange_id: error
+        for exchange_id, _, error in data
         if error
     }
 
@@ -224,8 +219,8 @@ async def scan_all():
 
     for symbol in SYMBOLS:
         quotes_for_symbol = [
-            (exchange, quotes[symbol])
-            for exchange, quotes, _ in data
+            (exchange_id, quotes[symbol])
+            for exchange_id, quotes, _ in data
             if symbol in quotes
         ]
 
@@ -260,16 +255,20 @@ async def scan_all():
     )
 
     available = {
-        exchange: list(quotes)
-        for exchange, quotes, _ in data
+        exchange_id: list(quotes)
+        for exchange_id, quotes, _ in data
     }
 
-    return opportunities[:30], errors, available
+    return (
+        opportunities[:30],
+        errors,
+        available,
+    )
 
 
-# -----------------------------
-# Background worker
-# -----------------------------
+# =====================================
+# BACKGROUND SCANNER
+# =====================================
 
 def worker():
     started = time.monotonic()
@@ -347,9 +346,9 @@ def worker():
             )
 
 
-# -----------------------------
-# HTTP routes
-# -----------------------------
+# =====================================
+# HTTP ROUTES
+# =====================================
 
 @app.get('/')
 def home():
@@ -407,6 +406,10 @@ def scan():
     }), 202
 
 
+# =====================================
+# TELEGRAM TEST
+# =====================================
+
 @app.post('/test-telegram')
 def test_telegram():
     if not authorized():
@@ -446,9 +449,9 @@ def test_telegram():
         }), 502
 
 
-# -----------------------------
-# Telegram diagnostics
-# -----------------------------
+# =====================================
+# TELEGRAM DIAGNOSTICS
+# =====================================
 
 @app.post('/telegram-chat-check')
 def telegram_chat_check():
@@ -522,9 +525,9 @@ def telegram_chat_check():
         }), 502
 
 
-# -----------------------------
-# Start server
-# -----------------------------
+# =====================================
+# SERVER
+# =====================================
 
 if __name__ == '__main__':
     app.run(
