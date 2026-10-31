@@ -142,7 +142,15 @@ async def consume(exchange, url, subscribe, parser, ping_interval=20):
 
 async def read_feed(ws, exchange, parser):
     async for raw in ws:
-        if isinstance(raw, bytes) or raw == 'pong':
+        if isinstance(raw, bytes):
+            if exchange == 'mexc':
+                try:
+                    for symbol, bid, ask, bq, aq in mexc_binary_parser(raw):
+                        update_quote(exchange, symbol, bid, ask, bq, aq)
+                except (ValueError, UnicodeError):
+                    pass
+            continue
+        if raw == 'pong':
             continue
         try:
             data = json.loads(raw)
@@ -163,17 +171,73 @@ def okx_parser(data):
     return out
 
 
+def protobuf_fields(payload):
+    """Read protobuf wire fields needed for MEXC's public best-bid/ask feed."""
+    pos = 0
+    fields = {}
+    while pos < len(payload):
+        key = 0
+        shift = 0
+        while True:
+            if pos >= len(payload) or shift > 63:
+                raise ValueError('Invalid protobuf key')
+            byte = payload[pos]
+            pos += 1
+            key |= (byte & 127) << shift
+            if byte < 128:
+                break
+            shift += 7
+        number, wire = key >> 3, key & 7
+        if number == 0:
+            raise ValueError('Invalid protobuf field')
+        if wire == 2:
+            length = 0
+            shift = 0
+            while True:
+                if pos >= len(payload) or shift > 63:
+                    raise ValueError('Invalid protobuf length')
+                byte = payload[pos]
+                pos += 1
+                length |= (byte & 127) << shift
+                if byte < 128:
+                    break
+                shift += 7
+            if length > len(payload) - pos:
+                raise ValueError('Truncated protobuf')
+            fields[number] = payload[pos:pos + length]
+            pos += length
+        elif wire == 0:
+            while True:
+                if pos >= len(payload):
+                    raise ValueError('Truncated protobuf varint')
+                byte = payload[pos]
+                pos += 1
+                if byte < 128:
+                    break
+        elif wire in (1, 5):
+            pos += 8 if wire == 1 else 4
+            if pos > len(payload):
+                raise ValueError('Truncated protobuf fixed field')
+        else:
+            raise ValueError('Unsupported protobuf wire type')
+    return fields
+
+
+def mexc_binary_parser(raw):
+    wrapper = protobuf_fields(raw)
+    symbol = wrapper.get(3, b'').decode('ascii')
+    if symbol not in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT') or 315 not in wrapper:
+        return []
+    book = protobuf_fields(wrapper[315])
+    bid, ask = book.get(1, b''), book.get(3, b'')
+    if not bid or not ask:
+        return []
+    return [(symbol[:-4] + '/USDT', bid.decode('ascii'), ask.decode('ascii'),
+             book.get(2, b'').decode('ascii'), book.get(4, b'').decode('ascii'))]
+
+
 def mexc_parser(data):
-    channel = data.get('c', '')
-    if 'bookTicker' not in channel:
-        return []
-    sym = data.get('s', '')
-    if sym not in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT'):
-        return []
-    row = data.get('d') or {}
-    bid = row.get('b') or row.get('bidPrice')
-    ask = row.get('a') or row.get('askPrice')
-    return [(sym[:-4] + '/USDT', bid, ask, row.get('B'), row.get('A'))] if bid and ask else []
+    return []
 
 
 def bitget_parser(data):
@@ -236,7 +300,7 @@ async def run():
     app.logger.info('WS V2 starting; Telegram configured: %s', bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID))
     jobs = [
         consume('okx', 'wss://ws.okx.com:8443/ws/v5/public', [{'op': 'subscribe', 'args': [{'channel': 'tickers', 'instId': s.replace('USDT', '-USDT')} for s in pairs]}], okx_parser),
-        consume('mexc', 'wss://wbs-api.mexc.com/ws', [{'method': 'SUBSCRIPTION', 'params': [f'spot@public.bookTicker.v3.api@{s}' for s in pairs]}], mexc_parser),
+        consume('mexc', 'wss://wbs-api.mexc.com/ws', [{'method': 'SUBSCRIPTION', 'params': [f'spot@public.aggre.bookTicker.v3.api.pb@10ms@{s}' for s in pairs]}], mexc_parser),
         consume('bitget', 'wss://ws.bitget.com/v2/ws/public', [{'op': 'subscribe', 'args': [{'instType': 'SPOT', 'channel': 'ticker', 'instId': s} for s in pairs]}], bitget_parser),
         consume('gate', 'wss://api.gateio.ws/ws/v4/', [{'time': int(time.time()), 'channel': 'spot.book_ticker', 'event': 'subscribe', 'payload': [s.replace('USDT', '_USDT') for s in pairs]}], gate_parser),
         consume('kraken', 'wss://ws.kraken.com/v2', [{'method': 'subscribe', 'params': {'channel': 'ticker', 'symbol': list(SYMBOLS), 'event_trigger': 'bbo'}}], kraken_parser),
