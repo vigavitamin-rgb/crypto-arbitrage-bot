@@ -22,6 +22,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 MAX_QUOTE_AGE = float(os.getenv('MAX_QUOTE_AGE_SECONDS', '3'))
 ALERT_COOLDOWN = float(os.getenv('ALERT_COOLDOWN_SECONDS', '120'))
+ALERT_CHECK_INTERVAL = float(os.getenv('ALERT_CHECK_INTERVAL_SECONDS', '0.02'))
 LOCK = threading.RLock()
 quotes = {}
 errors = {}
@@ -90,7 +91,7 @@ async def alert_loop():
                     await asyncio.to_thread(telegram_send, msg)
                 except Exception as exc:
                     app.logger.warning('Telegram send failed: %s', type(exc).__name__)
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(ALERT_CHECK_INTERVAL)
 
 
 async def consume(exchange, url, subscribe, parser, ping_interval=20):
