@@ -22,6 +22,9 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
 MAX_QUOTE_AGE = float(os.getenv('MAX_QUOTE_AGE_SECONDS', '3'))
 ALERT_COOLDOWN = float(os.getenv('ALERT_COOLDOWN_SECONDS', '120'))
+TRADE_BUDGET_USDT = float(os.getenv('SIM_TRADE_BUDGET_USDT', '50'))
+TAKER_FEE_PCT = float(os.getenv('SIM_TAKER_FEE_PCT', '0.1'))
+SLIPPAGE_PCT = float(os.getenv('SIM_SLIPPAGE_PCT', '0.05'))
 ALERT_CHECK_INTERVAL = float(os.getenv('ALERT_CHECK_INTERVAL_SECONDS', '0.02'))
 LOCK = threading.RLock()
 quotes = {}
@@ -71,7 +74,30 @@ def opportunities():
                     continue
                 pct = (sell['bid'] / buy['ask'] - 1) * 100
                 if pct >= THRESHOLD:
-                    results.append({'symbol': symbol, 'buy_exchange': buy_ex, 'sell_exchange': sell_ex, 'buy_ask': buy['ask'], 'sell_bid': sell['bid'], 'gross_spread_pct': round(pct, 3)})
+                    buy_price = buy['ask'] * (1 + SLIPPAGE_PCT / 100)
+                    sell_price = sell['bid'] * (1 - SLIPPAGE_PCT / 100)
+                    unit_cost = buy_price * (1 + TAKER_FEE_PCT / 100)
+                    unit_revenue = sell_price * (1 - TAKER_FEE_PCT / 100)
+                    quantity = max(0.0, TRADE_BUDGET_USDT) / unit_cost
+                    liquidity_verified = False
+                    try:
+                        buy_qty = float(buy['ask_qty'])
+                        sell_qty = float(sell['bid_qty'])
+                        if all(math.isfinite(q) and q > 0 for q in (buy_qty, sell_qty)):
+                            quantity = min(quantity, buy_qty, sell_qty)
+                            liquidity_verified = True
+                    except (TypeError, ValueError):
+                        pass
+                    net_profit = quantity * (unit_revenue - unit_cost)
+                    results.append({'symbol': symbol, 'buy_exchange': buy_ex, 'sell_exchange': sell_ex,
+                                    'buy_ask': buy['ask'], 'sell_bid': sell['bid'],
+                                    'gross_spread_pct': round(pct, 3),
+                                    'estimated_net_spread_pct': round((unit_revenue / unit_cost - 1) * 100, 3),
+                                    'estimated_profit_usdt': round(net_profit, 4),
+                                    'estimated_trade_cost_usdt': round(quantity * unit_cost, 2),
+                                    'liquidity_verified': liquidity_verified,
+                                    'assumed_fee_pct_per_side': TAKER_FEE_PCT,
+                                    'assumed_slippage_pct_per_side': SLIPPAGE_PCT})
     return sorted(results, key=lambda x: x['gross_spread_pct'], reverse=True)
 
 
@@ -91,6 +117,9 @@ async def alert_loop():
                        f"{item['symbol']}: {item['buy_exchange']} → {item['sell_exchange']}\n"
                        f"Покупка: {item['buy_ask']} / продажа: {item['sell_bid']}\n"
                        f"Спред: {item['gross_spread_pct']:.3f}%\n"
+                       f"Оценка чистой прибыли: {item['estimated_profit_usdt']:.4f} USDT "
+                       f"(оборот {item['estimated_trade_cost_usdt']:.2f} USDT)\n"
+                       f"Ликвидность подтверждена: {'да' if item['liquidity_verified'] else 'нет'}\n"
                        'Проверь комиссии, объём и доступность торгов.')
                 try:
                     await asyncio.to_thread(telegram_send, msg)
